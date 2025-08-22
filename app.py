@@ -645,12 +645,12 @@ def process():
                             and s.get("end") <= end
                         ]
 
-                    progress = 60 + (25 * topic_idx // max(1, len(topics)))
+                    progress = 60 + (10 * topic_idx // max(1, len(topics)))
                     update_processing_status(
                         video_id,
                         "summarizing",
                         progress,
-                        f"Processing topic {topic_idx + 1}/{len(topics)}: {topic_name}...",
+                        f"Generating summary {topic_idx + 1}/{len(topics)}: {topic_name}...",
                     )
 
                     logger.info(f"Generating summary for topic {topic_id}: {topic_name}")
@@ -671,44 +671,80 @@ def process():
                     topic_names.append(topic_name)
                     topic_keywords.append(keywords)
 
-                    try:
-                        logger.info(f"Generating TTS for topic {topic_id}")
-                        audio_path = text_to_speech(
-                            text=summary,
-                            output_dir=CONFIG["PROCESSED_DIR"],
-                            video_id=video_id,
-                            cluster_id=topic_id,
-                            voice=voice,
-                            language=target_language,
-                            slow=False,
-                        )
-                        if not audio_path or not os.path.exists(audio_path):
-                            raise FileNotFoundError("TTS file not generated")
-                        tts_paths.append(audio_path)
-                        topic_metadata.append(
-                            {
-                                "id": topic_id,
-                                "name": topic_name,
-                                "start_time": topic["start_time"],
-                                "end_time": topic["end_time"],
-                                "duration": topic["end_time"] - topic["start_time"],
-                                "segment_count": len(topic_segments),
-                                "summary": summary,
-                                "audio_path": audio_path,
-                                "keywords": keywords,
-                            }
-                        )
-                    except Exception as tts_error:
-                        logger.error(f"TTS generation failed for topic {topic_id}: {str(tts_error)}")
-                        silence = AudioSegment.silent(duration=5000)
-                        fallback_path = os.path.join(
-                            CONFIG["PROCESSED_DIR"], f"{video_id}_topic_{topic_id}_fallback.wav"
-                        )
-                        silence.export(fallback_path, format="wav")
-                        tts_paths.append(fallback_path)
-                        logger.info(f"Created silent fallback audio at {fallback_path}")
+                    topic_metadata.append(
+                        {
+                            "id": topic_id,
+                            "name": topic_name,
+                            "start_time": topic["start_time"],
+                            "end_time": topic["end_time"],
+                            "duration": topic["end_time"] - topic["start_time"],
+                            "segment_count": len(topic_segments),
+                            "summary": summary,
+                            # audio_path will be filled after parallel TTS
+                            "audio_path": None,
+                            "keywords": keywords,
+                        }
+                    )
 
-                if not tts_paths:
+                # Generate TTS in parallel for all topics to speed up processing
+                try:
+                    update_processing_status(
+                        video_id, "tts", 70, "Generating topic audio in parallel..."
+                    )
+
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    def _tts_worker(tmeta: Dict[str, Any]) -> Dict[str, Any]:
+                        try:
+                            audio_path_local = text_to_speech(
+                                text=tmeta.get("summary", ""),
+                                output_dir=CONFIG["PROCESSED_DIR"],
+                                video_id=video_id,
+                                cluster_id=tmeta.get("id"),
+                                voice=voice,
+                                language=target_language,
+                                slow=False,
+                            )
+                            if not audio_path_local or not os.path.exists(audio_path_local):
+                                raise FileNotFoundError("TTS file not generated")
+                            tmeta["audio_path"] = audio_path_local
+                        except Exception as tts_error:
+                            logger.error(
+                                f"TTS generation failed for topic {tmeta.get('id')}: {str(tts_error)}"
+                            )
+                            silence = AudioSegment.silent(duration=5000)
+                            fallback_path = os.path.join(
+                                CONFIG["PROCESSED_DIR"], f"{video_id}_topic_{tmeta.get('id')}_fallback.wav"
+                            )
+                            try:
+                                silence.export(fallback_path, format="wav")
+                            except Exception:
+                                pass
+                            tmeta["audio_path"] = fallback_path
+                        return tmeta
+
+                    max_workers = max(1, min(4, (os.cpu_count() or 2)))
+                    completed = 0
+                    total = len(topic_metadata)
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(_tts_worker, tm) for tm in topic_metadata]
+                        for _ in as_completed(futures):
+                            completed += 1
+                            # Smoothly advance progress up to 75 during TTS
+                            step_progress = 70 + int(5 * completed / max(1, total))
+                            update_processing_status(
+                                video_id,
+                                "tts",
+                                min(75, step_progress),
+                                f"Generated audio for {completed}/{total} topics...",
+                            )
+                    # Ensure topic_metadata contains updated audio paths
+                    topic_metadata = [f.result() for f in futures]
+                except Exception as e:
+                    logger.error(f"Parallel TTS failed: {str(e)}")
+                    # If parallel TTS fails, keep any audio_paths already set and continue
+
+                if not any(tm.get("audio_path") for tm in topic_metadata):
                     raise ValueError("Failed to generate audio for any topics")
 
             except Exception as e:
@@ -736,72 +772,74 @@ def process():
                 topic_videos: List[Dict[str, Any]] = []
                 total_topics = max(1, len(topic_metadata))
 
-                for idx, tmeta in enumerate(topic_metadata):
-                    # Determine how many keyframes to use for this topic
-                    target_kf = calculate_keyframe_distribution(
-                        tmeta.get("duration", 0.0)
-                    )
+                from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                    # Filter existing keyframes by topic time window
-                    topic_kfs = []
-                    if keyframe_metadata_all:
-                        topic_kfs = select_keyframes_for_topic(
-                            keyframe_metadata_all,
-                            tmeta["start_time"],
-                            tmeta["end_time"],
+                def _render_worker(tmeta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                    try:
+                        # Determine how many keyframes to use for this topic
+                        target_kf = calculate_keyframe_distribution(
+                            tmeta.get("duration", 0.0)
                         )
 
-                    # If we need more, extract additional frames from the time range
-                    if len(topic_kfs) < target_kf:
-                        try:
-                            extra_needed = max(0, target_kf - len(topic_kfs))
-                            if extra_needed > 0:
-                                additional = extract_keyframes_for_time_range(
-                                    video_path=video_path,
-                                    start_time=tmeta["start_time"],
-                                    end_time=tmeta["end_time"],
-                                    max_keyframes=extra_needed,
-                                )
-                                topic_kfs = sorted(
-                                    (topic_kfs or []) + (additional or []),
-                                    key=lambda x: x.get("timestamp", 0),
-                                )
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to extract additional keyframes for topic {tmeta.get('id')}: {e}"
+                        # Filter existing keyframes by topic time window
+                        topic_kfs = []
+                        if keyframe_metadata_all:
+                            topic_kfs = select_keyframes_for_topic(
+                                keyframe_metadata_all,
+                                tmeta["start_time"],
+                                tmeta["end_time"],
                             )
 
-                    # Cap to target count
-                    if target_kf > 0 and len(topic_kfs) > target_kf:
-                        topic_kfs = topic_kfs[:target_kf]
+                        # If we need more, extract additional frames from the time range
+                        if len(topic_kfs) < target_kf:
+                            try:
+                                extra_needed = max(0, target_kf - len(topic_kfs))
+                                if extra_needed > 0:
+                                    additional = extract_keyframes_for_time_range(
+                                        video_path=video_path,
+                                        start_time=tmeta["start_time"],
+                                        end_time=tmeta["end_time"],
+                                        max_keyframes=extra_needed,
+                                    )
+                                    topic_kfs = sorted(
+                                        (topic_kfs or []) + (additional or []),
+                                        key=lambda x: x.get("timestamp", 0),
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to extract additional keyframes for topic {tmeta.get('id')}: {e}"
+                                )
 
-                    if not topic_kfs:
-                        logger.warning(
-                            f"No keyframes available for topic {tmeta.get('id')} - skipping video generation."
+                        # Cap to target count
+                        if target_kf > 0 and len(topic_kfs) > target_kf:
+                            topic_kfs = topic_kfs[:target_kf]
+
+                        if not topic_kfs:
+                            logger.warning(
+                                f"No keyframes available for topic {tmeta.get('id')} - skipping video generation."
+                            )
+                            return None
+
+                        # Build a safe output base path (without extension; maker adds .mp4)
+                        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(tmeta.get("name", "topic"))).strip("_")
+                        output_base = os.path.join(
+                            CONFIG["PROCESSED_DIR"], f"{video_id}_topic_{tmeta.get('id')}_{safe_name}"
                         )
-                        continue
 
-                    # Build a safe output base path (without extension; maker adds .mp4)
-                    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(tmeta.get("name", "topic"))).strip("_")
-                    output_base = os.path.join(
-                        CONFIG["PROCESSED_DIR"], f"{video_id}_topic_{tmeta.get('id')}_{safe_name}"
-                    )
+                        # Render topic summary video
+                        topic_video_path = make_summary_video(
+                            output_path=output_base,
+                            keyframes=topic_kfs,
+                            audio_path=tmeta.get("audio_path"),
+                            resolution=out_resolution,
+                            fps=30,
+                            transition_type="fade",
+                            transition_duration=0.5,
+                            log_level="INFO",
+                        )
 
-                    # Render topic summary video
-                    topic_video_path = make_summary_video(
-                        output_path=output_base,
-                        keyframes=topic_kfs,
-                        audio_path=tmeta.get("audio_path"),
-                        resolution=out_resolution,
-                        fps=30,
-                        transition_type="fade",
-                        transition_duration=0.5,
-                        log_level="INFO",
-                    )
-
-                    if topic_video_path and os.path.exists(topic_video_path):
-                        topic_videos.append(
-                            {
+                        if topic_video_path and os.path.exists(topic_video_path):
+                            return {
                                 "topic_id": tmeta.get("id"),
                                 "name": tmeta.get("name"),
                                 "keywords": tmeta.get("keywords", []),
@@ -814,16 +852,27 @@ def process():
                                 "duration": tmeta.get("duration"),
                                 "keyframe_count": len(topic_kfs),
                             }
-                        )
+                        return None
+                    except Exception as e:
+                        logger.error(f"Render worker failed for topic {tmeta.get('id')}: {e}")
+                        return None
 
-                    # Update progress within rendering phase
-                    render_progress = 75 + int(20 * (idx + 1) / total_topics)
-                    update_processing_status(
-                        video_id,
-                        "rendering",
-                        min(95, render_progress),
-                        f"Generated {idx + 1}/{total_topics} topic videos",
-                    )
+                max_workers = max(1, min(4, (os.cpu_count() or 2)))
+                completed = 0
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(_render_worker, tm) for tm in topic_metadata]
+                    for fut in as_completed(futures):
+                        result_item = fut.result()
+                        if result_item:
+                            topic_videos.append(result_item)
+                        completed += 1
+                        render_progress = 75 + int(20 * completed / total_topics)
+                        update_processing_status(
+                            video_id,
+                            "rendering",
+                            min(95, render_progress),
+                            f"Generated {completed}/{total_topics} topic videos",
+                        )
 
                 # Optionally concatenate topic videos into a final summary
                 final_summary_video = None
