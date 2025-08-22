@@ -20,6 +20,8 @@
 let currentVideoId = null;
 let progressInterval = null;
 let currentTopicIndex = 0;
+// Support multiple concurrent jobs
+const jobs = new Map(); // videoId -> {card, progressEls}
 
 // DOM elements
 const uploadSection = document.getElementById('uploadSection');
@@ -72,7 +74,7 @@ function initializeFileUpload() {
     fileUploadArea.addEventListener('click', () => fileInput.click());
     
     fileUploadArea.addEventListener('dragover', (e) => {
-    e.preventDefault();
+        e.preventDefault();
         fileUploadArea.classList.add('dragover');
     });
     
@@ -85,15 +87,24 @@ function initializeFileUpload() {
         fileUploadArea.classList.remove('dragover');
         
         if (e.dataTransfer.files.length > 0) {
+            // Support multi-file
+            const files = Array.from(e.dataTransfer.files);
             fileInput.files = e.dataTransfer.files;
-            updateFileUploadDisplay(e.dataTransfer.files[0]);
+            updateFileUploadDisplay(files[0]);
+            if (files.length > 1) {
+                const uploadHint = fileUploadArea.querySelector('.upload-hint');
+                if (uploadHint) uploadHint.textContent += `  (+${files.length - 1} more)`;
+            }
         }
     });
     
     fileInput.addEventListener('change', (e) => {
         if (e.target.files.length > 0) {
-            console.log('File selected:', e.target.files[0].name, e.target.files[0].size);
             updateFileUploadDisplay(e.target.files[0]);
+            if (e.target.files.length > 1) {
+                const uploadHint = document.querySelector('#fileUploadArea .upload-hint');
+                if (uploadHint) uploadHint.textContent += `  (+${e.target.files.length - 1} more)`;
+            }
         }
     });
 }
@@ -155,67 +166,158 @@ async function submitForm() {
         submitBtn.disabled = true;
         submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
         
-        const formData = new FormData(videoForm);
-        
-        // Ensure the file is properly attached to FormData
-        const videoFile = document.getElementById('video_file').files[0];
-        if (videoFile) {
-            // Remove any existing entry and add the file
-            formData.delete('video_file');
-            formData.append('video_file', videoFile);
-            console.log('File attached to FormData:', videoFile.name, videoFile.size);
-        } else {
-            console.log('No file found in video_file input');
+        const ytRaw = document.getElementById('yt_url').value.trim();
+        const ytList = ytRaw
+            .split(/\n|,/)
+            .map(s => s.trim())
+            .filter(Boolean);
+        const files = Array.from((document.getElementById('video_file').files || []));
+
+        // Multi-job path: if more than 1 input provided, process in parallel
+        if ((files && files.length > 1) || (ytList && ytList.length > 1) || (files.length >= 1 && ytList.length >= 1)) {
+            await submitFormMulti(files, ytList);
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '<i class="fas fa-play"></i> Start Processing';
+            return;
         }
         
-        // Debug logging
-        console.log('Form data contents:');
-        for (let [key, value] of formData.entries()) {
-            if (value instanceof File) {
-                console.log(`${key}: File - ${value.name} (${value.size} bytes)`);
-            } else {
-                console.log(`${key}: ${value}`);
-            }
+        const formData = new FormData(videoForm);
+        const videoFile = files[0];
+        if (videoFile) {
+            formData.delete('video_file');
+            formData.append('video_file', videoFile);
         }
         
         const response = await fetch('/api/process', {
             method: 'POST',
             body: formData
         });
-        // Explicitly handle payload too large
         if (response.status === 413) {
-            let data = {};
-            try { data = await response.json(); } catch (_) {}
+            let data = {}; try { data = await response.json(); } catch (_) {}
             const msg = (data && (data.message || data.error)) ? (data.message || data.error) : 'File too large';
             showError(msg);
             submitBtn.disabled = false;
             submitBtn.innerHTML = '<i class="fas fa-play"></i> Start Processing';
             return;
         }
-
         if (!response.ok) {
-            let text = '';
-            try { text = await response.text(); } catch (_) {}
+            let text = ''; try { text = await response.text(); } catch (_) {}
             throw new Error(text || `HTTP error! status: ${response.status}`);
         }
-
         const result = await response.json();
-        
-        if (result.error) {
-            throw new Error(result.error);
-        }
-        
+        if (result.error) { throw new Error(result.error); }
         currentVideoId = result.video_id;
-        console.log('Processing started with video ID:', currentVideoId);
         showProcessingSection();
         startProgressTracking();
         
     } catch (error) {
-        console.error('Error submitting form:', error);
         showError(`Error: ${error.message}`);
         submitBtn.disabled = false;
         submitBtn.innerHTML = '<i class="fas fa-play"></i> Start Processing';
     }
+}
+
+async function submitFormMulti(files, ytList) {
+    const jobsContainer = document.getElementById('jobsContainer');
+    if (jobsContainer) jobsContainer.style.display = 'block';
+
+    const commonFields = new FormData(videoForm);
+
+    const tasks = [];
+
+    const launchJob = async (label, buildFormData) => {
+        try {
+            const fd = buildFormData(new FormData());
+            // copy common scalar fields
+            ['source_language','target_language','voice','resolution','enable_ocr'].forEach(k => {
+                if (commonFields.get(k) != null) fd.append(k, commonFields.get(k));
+            });
+            const resp = await fetch('/api/process', { method: 'POST', body: fd });
+            if (!resp.ok) { throw new Error(await resp.text() || 'Failed to start job'); }
+            const data = await resp.json();
+            const videoId = data.video_id;
+            const card = createJobCard(label, videoId);
+            jobs.set(videoId, card);
+            startProgressTrackingFor(videoId, card);
+        } catch (e) {
+            console.error('Failed to launch job', label, e);
+            showError(`Failed to start: ${label} — ${e.message}`);
+        }
+    };
+
+    // Files
+    for (const f of (files || [])) {
+        tasks.push(launchJob(f.name, (fd) => { fd.append('video_file', f); return fd; }));
+    }
+    // URLs
+    for (const url of (ytList || [])) {
+        tasks.push(launchJob(url, (fd) => { fd.append('yt_url', url); return fd; }));
+    }
+
+    await Promise.all(tasks);
+}
+
+function createJobCard(label, videoId) {
+    const container = document.getElementById('jobsContainer');
+    const card = document.createElement('div');
+    card.className = 'processing-section';
+    card.style.marginBottom = '12px';
+
+    const header = document.createElement('div');
+    header.className = 'processing-header';
+    header.innerHTML = `<h3 class="processing-title"><i class="fas fa-cogs"></i> ${label}</h3>`;
+
+    const progressContainer = document.createElement('div');
+    progressContainer.className = 'progress-container';
+
+    const percentEl = document.createElement('div');
+    percentEl.className = 'progress-percentage';
+    percentEl.textContent = '0%';
+
+    const msgEl = document.createElement('div');
+    msgEl.className = 'progress-message';
+    msgEl.textContent = 'Initializing...';
+
+    const bar = document.createElement('div');
+    bar.className = 'progress-bar';
+    const fill = document.createElement('div');
+    fill.className = 'progress-fill';
+    fill.style.width = '0%';
+    bar.appendChild(fill);
+
+    progressContainer.appendChild(percentEl);
+    progressContainer.appendChild(msgEl);
+    progressContainer.appendChild(bar);
+
+    card.appendChild(header);
+    card.appendChild(progressContainer);
+
+    container.appendChild(card);
+
+    return { card, percentEl, msgEl, fill, videoId, label };
+}
+
+function startProgressTrackingFor(videoId, card) {
+    const interval = setInterval(async () => {
+        try {
+            const response = await fetch(`/api/status/${videoId}`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const status = await response.json();
+            // Update UI
+            const p = status.progress || 0;
+            card.percentEl.textContent = `${p}%`;
+            card.msgEl.textContent = status.message || 'Processing...';
+            card.fill.style.width = `${p}%`;
+            if (status.status === 'completed') {
+                clearInterval(interval);
+                card.msgEl.textContent = 'Completed';
+            }
+            if (status.status === 'error') {
+                clearInterval(interval);
+                card.msgEl.textContent = `Error: ${status.error || 'failed'}`;
+            }
+        } catch (_) {}
+    }, 1000);
 }
 
 // Test upload functionality

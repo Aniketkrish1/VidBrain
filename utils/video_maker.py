@@ -536,8 +536,8 @@ def make_summary_video(
             # Use FFmpeg to mux video and audio
             cmd = [
                 'ffmpeg', '-y', '-i', temp_video, '-i', temp_audio,
-                '-c:v', 'libx264', '-profile:v', 'main', '-preset', 'medium',
-                '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
+                '-c:v', 'libx264', '-profile:v', 'main', '-preset', 'veryfast',
+                '-crf', '24', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
                 '-shortest', '-movflags', '+faststart', final_video
             ]
             

@@ -130,16 +130,16 @@
                 
                 <div class="form-group">
                     <label for="yt_url"><i class="fab fa-youtube"></i> YouTube URL (Optional)</label>
-                    <input type="url" class="form-control" id="yt_url" name="yt_url" placeholder="https://www.youtube.com/watch?v=...">
+                    <input type="url" class="form-control" id="yt_url" name="yt_url" placeholder="https://www.youtube.com/watch?v=...  (Tip: paste multiple, separated by commas or newlines)">
                 </div>
                 
                 <div class="form-group">
-                    <label for="video_file"><i class="fas fa-file-video"></i> Or Upload Video File</label>
+                    <label for="video_file"><i class="fas fa-file-video"></i> Or Upload Video File(s)</label>
                     <div class="file-upload-area" id="fileUploadArea">
                         <div class="upload-icon"><i class="fas fa-cloud-upload-alt"></i></div>
                         <div class="upload-text">Click to upload or drag & drop</div>
                         <div class="upload-hint">MP4, AVI, MOV, MKV, WEBM (Max {{ (max_file_size // (1024*1024)) }}MB)</div>
-                        <input type="file" id="video_file" name="video_file" accept="video/*" style="opacity: 0; position: absolute; pointer-events: none;">
+                        <input type="file" id="video_file" name="video_file" accept="video/*" multiple style="opacity: 0; position: absolute; pointer-events: none;">
                     </div>
                 </div>
                 
@@ -206,6 +206,9 @@
                 </div>
             </div>
         </div>
+
+        <!-- Multi-job Container -->
+        <div id="jobsContainer" class="results-section" style="display:none; margin-top: 20px;"></div>
 
         <!-- Results Section -->
         <div class="results-section" id="resultsSection">
