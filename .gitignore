@@ -1,0 +1,5 @@
+tools/
+*.mp4
+*.txt
+venv/
+.env
