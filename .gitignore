@@ -1,5 +1,7 @@
 tools/
 *.mp4
 *.txt
+!requirements.txt
 venv/
 .env
+utils/__pycache__

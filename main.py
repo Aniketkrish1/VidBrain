@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
-
+from dotenv import load_dotenv
+load_dotenv()
 # External libraries
 import numpy as np
 import whisper
@@ -38,19 +39,21 @@ from utils import topic_clustering as tc
 from utils import downloader as dl
 from utils import transcriber as tb
 from utils import summarizer as sz
+from utils.database import VectorDB, parse_srt
 
 # ==================== CONFIGURATION ====================
 # User-configurable variables
-YOUTUBE_URL = "https://www.youtube.com/watch?v=rbbTd-gkajw"  # Replace with actual URL
-WHISPER_MODEL = "base"  # Options: tiny, base, small, medium, large
-SPACY_MODEL = "en_core_web_sm"  # English language model for sentence segmentation
+YOUTUBE_URL = os.getenv("YOUTUBE_URL")  # Replace with actual URL
+WHISPER_MODEL =os.getenv("WHISPER_MODEL") # Options: tiny, base, small, medium, large
+SPACY_MODEL =os.getenv("SPACY_MODEL") # English language model for sentence segmentation
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Sentence transformer model
 SUMMARIZATION_MODEL = "facebook/bart-large-cnn"  # Hugging Face summarization model
 TTS_MODEL = "tts_models/en/ljspeech/tacotron2-DDC"  # Coqui TTS model
 MIN_CLUSTER_SIZE = 3  # Minimum sentences per topic cluster
 MAX_SUMMARY_LENGTH = 500  # Maximum length for topic summaries
-OUTPUT_VIDEO_NAME = "summary_video.mp4"
-TEMP_DIR = "temp_processing"
+OUTPUT_VIDEO_NAME = os.getenv("OUTPUT_VIDEO_NAME")
+TEMP_DIR = os.getenv("TEMP_DIR")
+
 LOG_LEVEL = logging.INFO
 
 # Setup logging
@@ -124,6 +127,19 @@ def cleanup_files():
 #         logger.error(f"Error during transcription: {e}")
 #         raise
 
+import datetime
+
+def seconds_to_srt_time(seconds: float) -> str:
+    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
+    td = datetime.timedelta(seconds=seconds)
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+
 def segment_and_realign_sentences(transcription_data: Dict) -> List[Dict]:
     """
     Segment transcript into sentences and realign word timestamps.
@@ -187,6 +203,19 @@ def segment_and_realign_sentences(transcription_data: Dict) -> List[Dict]:
     except Exception as e:
         logger.error(f"Error during sentence segmentation: {e}")
         raise
+
+
+def write_srt(sentences: List[Dict], filename: str = "transcript.srt"):
+    """Write segmented sentences to SRT file"""
+    with open(filename, "w", encoding="utf-8") as f:
+        for idx, sent in enumerate(sentences, start=1):
+            start_time = seconds_to_srt_time(sent["start"])
+            end_time = seconds_to_srt_time(sent["end"])
+            
+            f.write(f"{idx}\n")
+            f.write(f"{start_time} --> {end_time}\n")
+            f.write(f"{sent['text']}\n\n")
+    logger.info(f"SRT file saved to {filename}")
 
 # def cluster_topics(sentences: List[Dict]) -> Dict[int, List[Dict]]:
 #     """
@@ -365,6 +394,7 @@ def assemble_video(
             
             # Load voiceover audio
             voiceover_audio = AudioFileClip(voiceover_path)
+
             
             # Adjust video segment duration to match voiceover
             if voiceover_audio.duration < video_segment.duration:
@@ -374,7 +404,7 @@ def assemble_video(
                 video_segment = video_segment.loop(duration=voiceover_audio.duration)
             
             # Replace audio with voiceover
-            video_segment = video_segment.set_audio(voiceover_audio)
+            video_segment = video_segment.set_audio(voiceover_audio.audio_fadein(0.02).audio_fadeout(0.02))
             
             video_segments.append(video_segment)
             logger.info(f"Processed segment for cluster {cluster_id}")
@@ -388,7 +418,7 @@ def assemble_video(
             codec='libx264',
             audio_codec='aac',
             temp_audiofile='temp-audio.m4a',
-            remove_temp=True,
+            remove_temp=False,
             verbose=False,
             logger=None
         )
@@ -405,6 +435,7 @@ def assemble_video(
     except Exception as e:
         logger.error(f"Error during video assembly: {e}")
         raise
+
 
 # ==================== MAIN EXECUTION ====================
 
@@ -431,12 +462,14 @@ def main():
         # Step 3: Segment sentences
         logger.info("Step 3/7: Segmenting and aligning sentences...")
         sentences = segment_and_realign_sentences(transcription_data)
-        with open("sentences.txt",'w') as f:
-            for sentence in sentences:
-                f.write(sentence['text'])
-                f.write(f"{sentence['start']}")
-                f.write(f"{sentence['end']}")
-        
+        write_srt(sentences, "transcript.srt")
+        # Step 3b: Build vector database from transcript
+        logger.info("Step 3b: Building vector database from transcript...")
+        segments = parse_srt("transcript.srt")
+        db = VectorDB(db_path="vector_db.pkl")
+        db.build(segments)
+        logger.info("Vector database created with transcript embeddings")
+
         # Step 4: Cluster topics
         logger.info("Step 4/7: Clustering sentences into topics...")
         topic_clusters = tc.cluster_topics(sentences)

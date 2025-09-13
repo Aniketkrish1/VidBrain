@@ -1,71 +1,62 @@
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Tuple, Optional
-import os
-from dotenv import load_dotenv
-load_dotenv()
 import numpy as np
 import hdbscan
+from sentence_transformers import SentenceTransformer, util
+from typing import List, Dict
+from main import EMBEDDING_MODEL, MIN_CLUSTER_SIZE, logger
 
-e_model =os.getenv("EMBEDDING_MODEL")
-MIN_CLUSTER_SIZE = int(os.getenv("MIN_CLUSTER_SIZE"))
 
 def cluster_topics(sentences: List[Dict]) -> Dict[int, List[Dict]]:
     """
-    Cluster sentences into topics using SBERT embeddings (cosine similarity) + dynamic temporal weighting + HDBSCAN.
+    Cluster sentences into important topic groups using embeddings + HDBSCAN.
+
+    Args:
+        sentences: List of dicts with 'text', 'start', 'end', 'words'
+
+    Returns:
+        Dict[int, List[Dict]]: mapping cluster_id -> list of sentence dicts
     """
-    # logger.info("Generating sentence embeddings and clustering topics")
+    logger.info("Clustering sentences into topics with embeddings + HDBSCAN")
 
-    try:
-        # Load embedding model
-        encoder = SentenceTransformer(e_model)
-        sentence_texts = [s['text'] for s in sentences]
-        embeddings = encoder.encode(sentence_texts, show_progress_bar=False, normalize_embeddings=True)
+    if not sentences:
+        logger.warning("No sentences provided for clustering")
+        return {}
 
-        # Calculate video length
-        video_length = max(s['end'] for s in sentences)
-        temporal_weight = max(0.05, min(0.5, 1 - (video_length / 40)))  # dynamic scaling
+    # 1. Encode sentences
+    encoder = SentenceTransformer(EMBEDDING_MODEL)
+    texts = [s["text"] for s in sentences]
+    embeddings = encoder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
 
-        # logger.info(f"Dynamic temporal weight: {temporal_weight:.2f} for video length {video_length:.2f}s")
+    # 2. Importance filtering (drop filler sentences)
+    centroid = np.mean(embeddings, axis=0)
+    scores = util.cos_sim(embeddings, centroid.reshape(1, -1)).cpu().numpy().flatten()
+    threshold = np.percentile(scores, 20)  # keep top 60%
+    keep_idxs = [i for i, s in enumerate(scores) if s >= threshold]
 
-        # Normalize timestamps
-        times = np.array([s['start'] for s in sentences]).reshape(-1, 1)
-        times = (times - times.min()) / (times.max() - times.min())
+    if not keep_idxs:
+        logger.warning("No sentences passed importance filter")
+        return {}
 
-        # Combine using cosine for embeddings + weighted time penalty
-        # We create a custom distance matrix
-        from sklearn.metrics.pairwise import cosine_distances
-        cosine_dist = cosine_distances(embeddings)
-        temporal_dist = np.abs(times - times.T)  # pairwise temporal difference
+    kept_sentences = [sentences[i] for i in keep_idxs]
+    kept_emb = embeddings[keep_idxs]
 
-        # Weighted distance matrix
-        combined_dist = (1 - temporal_weight) * cosine_dist + temporal_weight * temporal_dist
+    # 3. HDBSCAN clustering (adaptive #topics, no fixed k)
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=2,
+        min_samples=1,
+        metric="euclidean"
+    )
+    labels = clusterer.fit_predict(kept_emb)
 
-        # Cluster using precomputed distance
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=MIN_CLUSTER_SIZE,
-            min_samples=1,
-            metric='precomputed'
-        )
-        cluster_labels = clusterer.fit_predict(combined_dist)
+    # 4. Group into clusters, drop noise (-1)
+    clusters = {}
+    for idx, lbl in enumerate(labels):
+        if lbl == -1:
+            continue
+        clusters.setdefault(lbl, []).append(kept_sentences[idx])
 
-        clusters = {}
-        for idx, label in enumerate(cluster_labels):
-            if label == -1:  # noise
-                continue
-            clusters.setdefault(label, []).append(sentences[idx])
+    # 5. Sort sentences in each cluster by time
+    for lbl in clusters:
+        clusters[lbl] = sorted(clusters[lbl], key=lambda x: x["start"])
 
-        # Sort clusters by first sentence time
-        sorted_clusters = dict(sorted(
-            clusters.items(),
-            key=lambda x: x[1][0]['start']
-        ))
-
-        # logger.info(f"Found {len(sorted_clusters)} topic clusters")
-        with open("sentence.txt",'w') as f:
-            for cluster in sorted_clusters.values():
-                print(cluster[0]['text'],file=f)
-        return sorted_clusters
-
-    except Exception as e:
-        # logger.error(f"Error during topic clustering: {e}")
-        raise
+    logger.info(f"Found {len(clusters)} topic clusters after filtering")
+    return clusters
