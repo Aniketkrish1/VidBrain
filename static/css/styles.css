@@ -1,0 +1,27 @@
+:root{--bg:#0b0f14;--panel:#121821;--muted:#a3b0c2;--text:#e6eef8;--accent:#5eead4;--accent2:#60a5fa;--danger:#ef4444}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,"Helvetica Neue",Arial,"Apple Color Emoji","Segoe UI Emoji";background:var(--bg);color:var(--text)}
+.container{max-width:960px;margin:0 auto;padding:24px}
+.header{display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;gap:12px;align-items:center}
+.logo{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:grid;place-items:center;color:#0b0f14;font-weight:800}
+nav a{color:var(--muted);text-decoration:none;margin-left:16px}
+nav a:hover{color:var(--text)}
+.hero{padding:48px 0;background:radial-gradient(1000px 400px at 20% -10%,rgba(96,165,250,.25),transparent),radial-gradient(1000px 400px at 80% 110%,rgba(94,234,212,.2),transparent)}
+.hero h2{font-size:32px;margin:0 0 8px}
+.hero p{color:var(--muted);margin:0}
+.card{background:var(--panel);border:1px solid #1f2937;border-radius:14px;padding:20px;margin-top:-28px;box-shadow:0 10px 24px rgba(0,0,0,.3)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+label{display:flex;flex-direction:column;gap:8px}
+input{background:#0e141c;border:1px solid #1f2937;border-radius:10px;padding:12px;color:var(--text)}
+.btn{margin-top:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#0b0f14;padding:12px 16px;border-radius:10px;font-weight:700;cursor:pointer}
+.btn:hover{filter:brightness(1.05)}
+.progress{height:10px;background:#0e141c;border:1px solid #1f2937;border-radius:999px;margin-top:16px;overflow:hidden}
+.bar{height:100%;background:linear-gradient(135deg,var(--accent),var(--accent2));width:0%}
+.job{margin-top:12px}
+.hidden{display:none}
+.muted{color:var(--muted)}
+.footer{color:var(--muted);font-size:14px;border-top:1px solid #1f2937;margin-top:40px}
+ol{margin:0;padding-left:18px}
+@media (max-width:640px){.grid{grid-template-columns:1fr}}
+
