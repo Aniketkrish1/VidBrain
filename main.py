@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-AI Video Summarizer
-====================
-A complete pipeline for creating AI-generated video summaries from YouTube videos.
-
-This script downloads a YouTube video, transcribes it, identifies key topics,
-generates summaries with AI voiceovers, and assembles a final summary video.
-
-Author: AI Video Processing Expert
-Date: 2025
+main.py — orchestrates:
+ - download (optional)
+ - transcription (expects transcriber.transcribe_audio -> {sentences, srt, language})
+ - topic retrieval (VectorDB search if user query; otherwise cluster_topics)
+ - scene detection (scene_detector.detect_scenes)
+ - summarization/classification (utils.summarizer.summarize_topics)
+ - TTS generation
+ - assemble condensed video
 """
 
 import os
@@ -16,502 +15,315 @@ import sys
 import json
 import shutil
 import logging
-import tempfile
+import gc
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-import warnings
-warnings.filterwarnings('ignore')
+
 from dotenv import load_dotenv
 load_dotenv()
-# External libraries
-import numpy as np
-import whisper
-import spacy
-import torch
-import hdbscan
-from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
-from TTS.api import TTS
-os.environ["TQDM_DISABLE"] = "1"
 
+# media libs
+import torch
+from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
+
+# TTS: use your existing TTS (Coqui TTS imported below). If your environment uses a different TTS, swap accordingly.
+from TTS.api import TTS
+
+# local utils (assumed present)
 from utils import topic_clustering as tc
 from utils import downloader as dl
 from utils import transcriber as tb
 from utils import summarizer as sz
 from utils.database import VectorDB, parse_srt
+from utils import scene_detector as sd
 
-# ==================== CONFIGURATION ====================
-# User-configurable variables
-YOUTUBE_URL = os.getenv("YOUTUBE_URL")  # Replace with actual URL
-WHISPER_MODEL =os.getenv("WHISPER_MODEL") # Options: tiny, base, small, medium, large
-SPACY_MODEL =os.getenv("SPACY_MODEL") # English language model for sentence segmentation
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Sentence transformer model
-SUMMARIZATION_MODEL = "facebook/bart-large-cnn"  # Hugging Face summarization model
-TTS_MODEL = "tts_models/en/ljspeech/tacotron2-DDC"  # Coqui TTS model
-MIN_CLUSTER_SIZE = 3  # Minimum sentences per topic cluster
-MAX_SUMMARY_LENGTH = 500  # Maximum length for topic summaries
-OUTPUT_VIDEO_NAME = os.getenv("OUTPUT_VIDEO_NAME")
-TEMP_DIR = os.getenv("TEMP_DIR")
+# ==== CONFIG ====
+TEMP_DIR = os.getenv("TEMP_DIR", "temp_processing")
+OUTPUT_VIDEO_NAME = os.getenv("OUTPUT_VIDEO_NAME", "summary_output.mp4")
+TTS_MODEL = os.getenv("TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC")
+EMBEDDING_DB_PATH = os.getenv("VECTOR_DB_PATH", "vector_db.pkl")
+KEEP_CLUSTER_PERCENTILE = float(os.getenv("KEEP_CLUSTER_PERCENTILE", "10.0"))
+MIN_CLUSTER_SIZE = int(os.getenv("MIN_CLUSTER_SIZE", "2"))
 
-LOG_LEVEL = logging.INFO
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("main")
 
-# Setup logging
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("app.log")
+# ==== helpers ====
+def setup_dirs():
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    logger.info("Temp dir: %s", TEMP_DIR)
 
-# ==================== HELPER FUNCTIONS ====================
-
-def setup_directories():
-    """Create necessary directories for processing."""
-    Path(TEMP_DIR).mkdir(exist_ok=True)
-    logger.info(f"Created temporary directory: {TEMP_DIR}")
-
-def cleanup_files():
-    """Remove temporary files and directories."""
+def cleanup():
     try:
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR)
-            logger.info("Cleaned up temporary files")
+            logger.info("Cleaned up temp files")
     except Exception as e:
-        logger.warning(f"Could not fully clean up temporary files: {e}")
+        logger.warning("Cleanup failed: %s", e)
 
-# ==================== MAIN PROCESSING FUNCTIONS ====================
-# def transcribe_audio(audio_path: str) -> Dict:
-#     """
-#     Transcribe audio using OpenAI Whisper with word-level timestamps.
-    
-#     Args:
-#         audio_path: Path to the audio file
-        
-#     Returns:
-#         Dictionary containing transcription results with word timestamps
-#     """
-#     logger.info(f"Transcribing audio with Whisper model: {WHISPER_MODEL}")
-    
-#     try:
-#         # Load Whisper model
-#         model = whisper.load_model(WHISPER_MODEL)
-        
-#         # Transcribe with word timestamps
-#         result = model.transcribe(
-#             audio_path,
-#             word_timestamps=True,
-#             verbose=None,
-            
-#         )
-        
-#         logger.info(f"Transcription complete. Found {len(result['segments'])} segments")
-        
-#         # Extract word-level information
-#         words_data = []
-#         for segment in result['segments']:
-#             if 'words' in segment:
-#                 for word in segment['words']:
-#                     words_data.append({
-#                         'word': word['word'].strip(),
-#                         'start': word['start'],
-#                         'end': word['end']
-#                     })
-        
-#         return {
-#             'text': result['text'],
-#             'words': words_data,
-#             'segments': result['segments']
-#         }
-        
-#     except Exception as e:
-#         logger.error(f"Error during transcription: {e}")
-#         raise
+# safe bounding for None end times
+def normalize_end(end: Optional[float], video_duration: float) -> float:
+    return video_duration if end is None else float(end)
 
-import datetime
-
-def seconds_to_srt_time(seconds: float) -> str:
-    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
-    td = datetime.timedelta(seconds=seconds)
-    total_seconds = int(td.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    secs = total_seconds % 60
-    millis = int((seconds - int(seconds)) * 1000)
-    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
-
-
-def segment_and_realign_sentences(transcription_data: Dict) -> List[Dict]:
+# ==== Retrieval utilities ====
+def retrieve_by_query(db: VectorDB, query: str, top_k: int = 50) -> List[Dict]:
     """
-    Segment transcript into sentences and realign word timestamps.
-    
-    Args:
-        transcription_data: Dictionary with transcription and word timestamps
-        
-    Returns:
-        List of sentences with aligned timestamps
+    Use VectorDB search to fetch top_k transcript segments relevant to `query`.
+    Expected that db.search returns list of dicts with keys: 'text','start','end','score' (score optional).
     """
-    logger.info("Segmenting text into sentences with spaCy")
-    
+    hits = db.search(query, top_k=top_k)  # adjust per your VectorDB API
+    # ensure shape
+    result = []
+    for h in hits:
+        # handle both dict and tuple shaped returns
+        if isinstance(h, dict):
+            text = h.get("text") or h.get("content") or ""
+            start = float(h.get("start", 0.0))
+            end = float(h.get("end", start))
+            result.append({"text": text, "start": start, "end": end})
+        elif isinstance(h, (list, tuple)) and len(h) >= 3:
+            text, start, end = h[0], float(h[1]), float(h[2])
+            result.append({"text": text, "start": start, "end": end})
+    # sort temporally
+    return sorted(result, key=lambda x: x["start"])
+
+def merge_adjacent_segments(segments: List[Dict], gap_threshold: float = 2.0) -> List[List[Dict]]:
+    """
+    Merge segments into groups: if consecutive segments are within `gap_threshold` seconds,
+    they are merged into same logical group. Returns list of grouped segment-lists.
+    """
+    if not segments:
+        return []
+    groups = []
+    current = [segments[0]]
+    for s in segments[1:]:
+        prev = current[-1]
+        if s["start"] <= prev["end"] + gap_threshold:
+            current.append(s)
+        else:
+            groups.append(current)
+            current = [s]
+    if current:
+        groups.append(current)
+    return groups
+
+def make_topic_clusters_from_db_hits(groups: List[List[Dict]]) -> Dict[int, List[Dict]]:
+    """
+    Convert grouped hits into a cluster dict {0: [sentences...], 1: [...]}
+    Each sentence item keeps text,start,end.
+    """
+    clusters = {}
+    for idx, grp in enumerate(groups):
+        # flatten into sentence-like dicts (keep original items)
+        clusters[idx] = [ {"text": s["text"], "start": s["start"], "end": s["end"]} for s in grp ]
+    return clusters
+
+# ==== TTS helper ====
+def generate_voiceovers_from_summaries(summaries: Dict[int, Dict], tts_model: str = TTS_MODEL) -> Dict[int, str]:
+    """
+    Input summaries: {cluster_id: {"summary": str, "start": float, "end": float, ...}}
+    Returns: {cluster_id: audio_path}
+    """
+    logger.info("Starting TTS generation for %d summaries", len(summaries))
+    tts = TTS(model_name=tts_model, progress_bar=False, gpu=torch.cuda.is_available())
+    out = {}
+    for cid, data in summaries.items():
+        summary_text = data.get("summary", "")
+        if not summary_text:
+            logger.warning("Empty summary for cluster %s, skipping TTS", cid)
+            continue
+        file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.wav")
+        try:
+            tts.tts_to_file(text=summary_text, file_path=file_path)
+            out[cid] = file_path
+            logger.info("TTS written for cluster %s -> %s", cid, file_path)
+        except Exception as e:
+            logger.error("TTS failed for cluster %s: %s", cid, e)
+    return out
+
+# ==== assemble (uses summaries dict) ====
+def assemble_from_summaries(video_path: str, summaries: Dict[int, Dict], voiceover_paths: Dict[int, str], output_path: str) -> str:
+    logger.info("Assembling final video using %d summaries", len(summaries))
+    original = None
+    segments = []
     try:
-        # Load spaCy model
-        nlp = spacy.load(SPACY_MODEL)
-        
-        # Process full text
-        doc = nlp(transcription_data['text'])
-        
-        # Extract sentences
-        sentences = []
-        words = transcription_data['words']
-        word_idx = 0
-        
-        for sent in doc.sents:
-            sent_text = sent.text.strip()
-            if not sent_text:
+        original = VideoFileClip(video_path)
+        duration = original.duration
+        for cid in sorted(summaries.keys()):
+            data = summaries[cid]
+            start = float(data.get("start", 0.0))
+            end = data.get("end", None)
+            end = normalize_end(end, duration)
+
+            if end <= start:
+                logger.warning("Cluster %s has non-positive duration (%s-%s), skipping", cid, start, end)
                 continue
-                
-            # Find corresponding words for this sentence
-            sent_words = sent_text.lower().split()
-            sent_start = None
-            sent_end = None
-            
-            # Match words to get timestamps
-            temp_word_idx = word_idx
-            matched_words = []
-            
-            for target_word in sent_words:
-                for i in range(temp_word_idx, len(words)):
-                    if target_word in words[i]['word'].lower():
-                        if sent_start is None:
-                            sent_start = words[i]['start']
-                        sent_end = words[i]['end']
-                        matched_words.append(words[i])
-                        temp_word_idx = i + 1
-                        break
-            
-            if sent_start is not None and sent_end is not None:
-                sentences.append({
-                    'text': sent_text,
-                    'start': sent_start,
-                    'end': sent_end,
-                    'words': matched_words
-                })
-                word_idx = temp_word_idx
-        
-        logger.info(f"Segmented into {len(sentences)} sentences")
-        return sentences
-        
-    except Exception as e:
-        logger.error(f"Error during sentence segmentation: {e}")
-        raise
 
+            voice_path = voiceover_paths.get(cid)
+            if not voice_path or not os.path.exists(voice_path):
+                raise FileNotFoundError(f"Voiceover for cluster {cid} not found: {voice_path}")
 
-def write_srt(sentences: List[Dict], filename: str = "transcript.srt"):
-    """Write segmented sentences to SRT file"""
-    with open(filename, "w", encoding="utf-8") as f:
-        for idx, sent in enumerate(sentences, start=1):
-            start_time = seconds_to_srt_time(sent["start"])
-            end_time = seconds_to_srt_time(sent["end"])
-            
-            f.write(f"{idx}\n")
-            f.write(f"{start_time} --> {end_time}\n")
-            f.write(f"{sent['text']}\n\n")
-    logger.info(f"SRT file saved to {filename}")
+            logger.info("Cutting cluster %s: %.2f - %.2f", cid, start, end)
+            clip = original.subclip(start, end)
+            audio_clip = AudioFileClip(voice_path)
 
-# def cluster_topics(sentences: List[Dict]) -> Dict[int, List[Dict]]:
-#     """
-#     Cluster sentences into topics using embeddings and HDBSCAN.
-    
-#     Args:
-#         sentences: List of sentence dictionaries
-        
-#     Returns:
-#         Dictionary mapping cluster IDs to sentences
-#     """
-#     logger.info("Generating sentence embeddings and clustering topics")
-    
-#     try:
-#         # Load sentence transformer model
-#         encoder = SentenceTransformer(EMBEDDING_MODEL)
-        
-#         # Generate embeddings
-#         sentence_texts = [s['text'] for s in sentences]
-#         embeddings = encoder.encode(sentence_texts, show_progress_bar=False)
-        
-#         # Perform clustering with HDBSCAN
-#         clusterer = hdbscan.HDBSCAN(
-#             min_cluster_size=MIN_CLUSTER_SIZE,
-#             min_samples=1,
-#             metric='cosine'
-#         )
-        
-#         cluster_labels = clusterer.fit_predict(embeddings)
-        
-#         # Group sentences by cluster
-#         clusters = {}
-#         for idx, label in enumerate(cluster_labels):
-#             if label == -1:  # Noise points
-#                 continue
-#             if label not in clusters:
-#                 clusters[label] = []
-#             clusters[label].append(sentences[idx])
-        
-#         # Sort clusters by temporal order (first sentence appearance)
-#         sorted_clusters = dict(sorted(
-#             clusters.items(),
-#             key=lambda x: x[1][0]['start']
-#         ))
-        
-#         logger.info(f"Found {len(sorted_clusters)} topic clusters")
-#         with open("sentence.txt",'w') as f:
-#             for cluster in sorted_clusters.values():
+            # sync durations
+            if audio_clip.duration < clip.duration:
+                clip = clip.subclip(0, audio_clip.duration)
+            elif audio_clip.duration > clip.duration:
+                clip = clip.loop(duration=audio_clip.duration)
 
-#                 print(cluster[0],file=f)
-#         return sorted_clusters
-        
-#     except Exception as e:
-#         logger.error(f"Error during topic clustering: {e}")
-#         raise
+            clip = clip.set_audio(audio_clip)
+            segments.append(clip)
 
-# def summarize_topics(topic_clusters: Dict[int, List[Dict]]) -> Dict[int, str]:
-#     """
-#     Generate summaries for each topic cluster.
-    
-#     Args:
-#         topic_clusters: Dictionary mapping cluster IDs to sentences
-        
-#     Returns:
-#         Dictionary mapping cluster IDs to summary text
-#     """
-#     logger.info("Generating summaries for topic clusters")
-    
-#     try:
-#         # Initialize summarization pipeline
-#         summarizer = pipeline(
-#             "summarization",
-#             model=SUMMARIZATION_MODEL,
-#             device=0 if torch.cuda.is_available() else -1
-#         )
-        
-#         summaries = {}
-        
-#         for cluster_id, sentences in topic_clusters.items():
-#             # Combine sentences in cluster
-#             cluster_text = " ".join([s['text'] for s in sentences])
-            
-#             # Generate summary
-#             if len(cluster_text.split()) > 40:  # Only summarize if substantial
-#                 summary = summarizer(
-#                     cluster_text,
-#                     max_length=MAX_SUMMARY_LENGTH,
-#                     min_length=30,
-#                     do_sample=False
-#                 )[0]['summary_text']
-#             else:
-#                 summary = cluster_text  # Use original if too short
-            
-#             summaries[cluster_id] = summary
-#             logger.info(f"Generated summary for cluster {cluster_id}")
-        
-#         return summaries
-        
-#     except Exception as e:
-#         logger.error(f"Error during summarization: {e}")
-#         raise
+        if not segments:
+            raise RuntimeError("No segments to concatenate; nothing to assemble.")
 
-def generate_voiceovers(summaries: Dict[int, str]) -> Dict[int, str]:
-    """
-    Generate TTS voiceovers for each summary.
-    
-    Args:
-        summaries: Dictionary mapping cluster IDs to summary text
-        
-    Returns:
-        Dictionary mapping cluster IDs to audio file paths
-    """
-    logger.info("Generating TTS voiceovers")
-    
-    try:
-        # Initialize TTS model
-        tts = TTS(model_name=TTS_MODEL, progress_bar=False, gpu=torch.cuda.is_available())
-        
-        voiceover_paths = {}
-        
-        for cluster_id, summary_text in summaries.items():
-            # Generate audio file path
-            audio_path = os.path.join(TEMP_DIR, f"voiceover_{cluster_id}.wav")
-            
-            # Generate speech
-            tts.tts_to_file(
-                text=summary_text,
-                file_path=audio_path
-            )
-            
-            voiceover_paths[cluster_id] = audio_path
-            logger.info(f"Generated voiceover for cluster {cluster_id}")
-        
-        return voiceover_paths
-        
-    except Exception as e:
-        logger.error(f"Error during TTS generation: {e}")
-        raise
+        final = concatenate_videoclips(segments, method="compose")
+        final.write_videofile(output_path, codec="libx264", audio_codec="aac",
+                              temp_audiofile=os.path.join(TEMP_DIR, "temp-audio.m4a"),
+                              remove_temp=True, verbose=False, logger=None)
 
-def assemble_video(
-    video_path: str,
-    topic_clusters: Dict[int, List[Dict]],
-    voiceover_paths: Dict[int, str],
-    output_path: str
-) -> str:
-    """
-    Assemble final summary video with topic clips and voiceovers.
-    
-    Args:
-        video_path: Path to original video
-        topic_clusters: Dictionary mapping cluster IDs to sentences
-        voiceover_paths: Dictionary mapping cluster IDs to audio paths
-        output_path: Path for output video
-        
-    Returns:
-        Path to final video
-    """
-    logger.info("Assembling final summary video")
-    
-    try:
-        # Load original video
-        original_video = VideoFileClip(video_path)
-        
-        video_segments = []
-        
-        for cluster_id in sorted(topic_clusters.keys()):
-            sentences = topic_clusters[cluster_id]
-            voiceover_path = voiceover_paths[cluster_id]
-            
-            # Get time range for this cluster
-            start_time = sentences[0]['start']
-            end_time = sentences[-1]['end']
-            
-            # Extract video segment
-            video_segment = original_video.subclip(start_time, end_time)
-            
-            # Load voiceover audio
-            voiceover_audio = AudioFileClip(voiceover_path)
-
-            
-            # Adjust video segment duration to match voiceover
-            if voiceover_audio.duration < video_segment.duration:
-                video_segment = video_segment.subclip(0, voiceover_audio.duration)
-            elif voiceover_audio.duration > video_segment.duration:
-                # Loop or extend video if voiceover is longer
-                video_segment = video_segment.loop(duration=voiceover_audio.duration)
-            
-            # Replace audio with voiceover
-            video_segment = video_segment.set_audio(voiceover_audio.audio_fadein(0.02).audio_fadeout(0.02))
-            
-            video_segments.append(video_segment)
-            logger.info(f"Processed segment for cluster {cluster_id}")
-        
-        # Concatenate all segments
-        final_video = concatenate_videoclips(video_segments, method="compose")
-        
-        # Write final video
-        final_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            temp_audiofile='temp-audio.m4a',
-            remove_temp=False,
-            verbose=False,
-            logger=None
-        )
-        
-        # Clean up
-        original_video.close()
-        for segment in video_segments:
-            segment.close()
-        final_video.close()
-        
-        logger.info(f"Final video saved to: {output_path}")
+        logger.info("Wrote final video: %s", output_path)
         return output_path
-        
-    except Exception as e:
-        logger.error(f"Error during video assembly: {e}")
-        raise
 
+    finally:
+        # try to close everything to release handles
+        try:
+            if original:
+                original.close()
+        except Exception:
+            pass
+        for s in segments:
+            try:
+                s.close()
+            except Exception:
+                pass
+        gc.collect()
 
-# ==================== MAIN EXECUTION ====================
+# ==== pipeline entry point ====
+def process_video(video_path: Optional[str], youtube_url: Optional[str], query: Optional[str], output_path: str):
+    """
+    If youtube_url provided -> download video -> set video_path accordingly.
+    If video_path provided -> use it.
+    query: optional user query string (topic to extract); if None, auto-detect topics (clustering)
+    """
+    setup_dirs()
 
-def main():
-    """Main execution function that orchestrates the entire pipeline."""
-    
-    logger.info("="*50)
-    logger.info("Starting AI Video Summarizer Pipeline")
-    logger.info("="*50)
-    
+    # 1) Download or use local
+    if youtube_url:
+        try:
+            logger.info("Downloading video from URL")
+            video_path, audio_path = dl.download_and_extract_audio(youtube_url)
+        except Exception as e:
+            logger.error("Download failed: %s", e)
+            raise
+    elif video_path:
+        video_path = str(video_path)
+        audio_path = os.path.join(TEMP_DIR, "audio.mp3")
+        # try to extract audio if not provided
+        if not os.path.exists(audio_path):
+            import subprocess
+            subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", audio_path], check=False)
+    else:
+        raise ValueError("Either video_path or youtube_url must be provided")
+
+    # 2) Transcribe
+    logger.info("Transcribing audio")
+    trans_data = tb.transcribe_audio(audio_path)
+    # trans_data expected: { "sentences": [ {"text","start","end","words"}, ... ], "srt": "...", "language": "en" }
+    sentences = trans_data.get("sentences", [])
+    if not sentences:
+        raise RuntimeError("Transcription produced no sentences")
+
+    # Build / load vector DB
+    logger.info("Building or loading vector DB")
+    db = VectorDB(db_path=EMBEDDING_DB_PATH)
+    # Build expects segments list - adapt parse_srt or sentences shape as required
     try:
-        # Setup
-        setup_directories()
-        
-        # Step 1: Download and extract audio
-        logger.info("Step 1/7: Downloading video and extracting audio...")
-        video_path, audio_path = dl.download_and_extract_audio(YOUTUBE_URL)
-        
-        # Step 2: Transcribe audio
-        logger.info("Step 2/7: Transcribing audio with Whisper...")
-        print(audio_path)
-        transcription_data = tb.transcribe_audio(audio_path)
-        
-        # Step 3: Segment sentences
-        logger.info("Step 3/7: Segmenting and aligning sentences...")
-        sentences = segment_and_realign_sentences(transcription_data)
-        write_srt(sentences, "transcript.srt")
-        # Step 3b: Build vector database from transcript
-        logger.info("Step 3b: Building vector database from transcript...")
-        segments = parse_srt("transcript.srt")
-        db = VectorDB(db_path="vector_db.pkl")
-        db.build(segments)
-        logger.info("Vector database created with transcript embeddings")
-
-        # Step 4: Cluster topics
-        logger.info("Step 4/7: Clustering sentences into topics...")
-        topic_clusters = tc.cluster_topics(sentences)
-        
-        if not topic_clusters:
-            logger.error("No topic clusters found. Exiting.")
-            return
-        
-        # Step 5: Generate summaries
-        logger.info("Step 5/7: Generating topic summaries...")
-        summaries = sz.summarize_topics(topic_clusters)
-        
-        # Step 6: Generate voiceovers
-        logger.info("Step 6/7: Generating TTS voiceovers...")
-        voiceover_paths = generate_voiceovers(summaries)
-        
-        # Step 7: Assemble final video
-        logger.info("Step 7/7: Assembling final summary video...")
-        final_video_path = assemble_video(
-            video_path,
-            topic_clusters,
-            voiceover_paths,
-            OUTPUT_VIDEO_NAME
-        )
-        
-        # Cleanup
-        cleanup_files()
-        
-        logger.info("="*50)
-        logger.info(f"✅ Success! Summary video created: {final_video_path}")
-        logger.info(f"Topics identified: {len(topic_clusters)}")
-        logger.info("="*50)
-        
-    except KeyboardInterrupt:
-        logger.info("Process interrupted by user")
-        cleanup_files()
-        sys.exit(1)
-        
+        segments_for_db = [ {"text": s["text"], "start": s["start"], "end": s["end"]} for s in sentences ]
+        db.build(segments_for_db)
     except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
-        cleanup_files()
+        logger.warning("VectorDB build warning: %s", e)
+
+    # 3) Determine clusters (either via query retrieval or automatic clustering)
+    if query and query.strip():
+        logger.info("User query provided; retrieving relevant transcript segments")
+        hits = retrieve_by_query(db, query, top_k=5)
+        if not hits:
+            logger.warning("No results from vector DB for query; falling back to clustering entire transcript")
+            topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
+        else:
+            # merge temporally proximate hits into groups; this keeps explanation parts separated by filler merged
+            groups = merge_adjacent_segments(hits, gap_threshold=3.0)
+            topic_clusters = make_topic_clusters_from_db_hits(groups)
+    else:
+        logger.info("No query: clustering entire transcript")
+        topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
+
+    if not topic_clusters:
+        raise RuntimeError("No topic clusters found after retrieval/clustering")
+
+    logger.info("Clusters prepared: %d", len(topic_clusters))
+
+    # 4) Scene detection (GPU-accelerated ffmpeg hybrid)
+    scenes = sd.detect_scenes(video_path)
+    # scenes is list of (start,end) where end may be None for last segment
+
+    # 5) Summarize clusters (classification + summarization; returns cluster_id -> {summary,start,end,sentences})
+    # pass video duration so summarizer can normalize None -> duration
+    with VideoFileClip(video_path) as v:
+        video_duration = v.duration
+
+    summaries = sz.summarize_topics(topic_clusters, scenes, video_duration=video_duration, require_classification=True, use_openrouter=True)
+
+    if not summaries:
+        raise RuntimeError("Summarizer returned no summaries (all clusters filtered)")
+
+    # 6) TTS generation
+    voiceover_paths = generate_voiceovers_from_summaries(summaries, tts_model=TTS_MODEL)
+
+    # sanity check
+    missing = [cid for cid in summaries.keys() if cid not in voiceover_paths]
+    if missing:
+        logger.warning("Missing voiceovers for clusters: %s", missing)
+
+    # 7) Assemble condensed video
+    final = assemble_from_summaries(video_path, summaries, voiceover_paths, output_path)
+
+    # 8) cleanup
+    cleanup()
+    logger.info("Pipeline finished successfully")
+    return final
+
+# ==== CLI ====
+if __name__ == "__main__":
+    try:
+        print("="*60)
+        print("🎥  AI Video Summarizer")
+        print("="*60)
+
+        youtube_url = input("Enter YouTube URL (leave blank if using a local file): ").strip()
+        local_video = ""
+        if not youtube_url:
+            local_video = input("Enter path to local video file: ").strip()
+
+        query = input("Enter topic query (optional, leave blank to condense full video): ").strip()
+        output_path = input("Enter output file name (default summary_output.mp4): ").strip() or OUTPUT_VIDEO_NAME
+
+        if youtube_url:
+            video_path = None
+        else:
+            video_path = local_video if local_video else None
+
+        if not (youtube_url or video_path):
+            print("You must enter either a YouTube URL or a local video path.")
+            sys.exit(1)
+
+        process_video(video_path, youtube_url, query if query else None, output_path)
+
+    except Exception as e:
+        logger.exception("Pipeline failed: %s", e)
         sys.exit(1)
 
-if __name__ == "__main__":
-    main()

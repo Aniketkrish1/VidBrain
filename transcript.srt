@@ -541,4 +541,3 @@ Let me know what concept you want me to easily explain on this channel.
 136
 00:10:34,159 --> 00:10:42,279
 If you're interested, I have a video  where I give 40 APIs you should use for your next project  as well as a video where I give $10,000  to the worst trading bot I've ever built.
-

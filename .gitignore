@@ -5,3 +5,8 @@ tools/
 venv/
 .env
 utils/__pycache__
+temp_processing/
+cache/
+vector_db.pkl
+temp-audio.m4a
+optimized_video_condenser.py

@@ -1,62 +1,79 @@
+"""
+utils/topic_clustering.py
+
+Cluster transcript sentences into topic clusters using sentence embeddings + HDBSCAN.
+Returns { cluster_id: [ {text,start,end}, ... ] }
+"""
+
+import logging
+from typing import List, Dict, Optional
 import numpy as np
+from sentence_transformers import SentenceTransformer
 import hdbscan
-from sentence_transformers import SentenceTransformer, util
-from typing import List, Dict
-from main import EMBEDDING_MODEL, MIN_CLUSTER_SIZE, logger
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-def cluster_topics(sentences: List[Dict]) -> Dict[int, List[Dict]]:
+def cluster_topics(
+    sentences: List[Dict],
+    embedding_model: Optional[str] = None,
+    min_cluster_size: int = 3,
+    keep_percentile: float = 0.0
+) -> Dict[int, List[Dict]]:
     """
-    Cluster sentences into important topic groups using embeddings + HDBSCAN.
+    Cluster sentences into topics using embeddings and HDBSCAN.
 
     Args:
-        sentences: List of dicts with 'text', 'start', 'end', 'words'
+        sentences: list of dicts each with keys at least 'text','start','end'
+        embedding_model: optional str name of sentence transformer model; 
+                         if None defaults to 'all-MiniLM-L6-v2'
+        min_cluster_size: minimum cluster size for HDBSCAN
+        keep_percentile: optional, drop clusters whose total text length < percentile threshold
 
     Returns:
-        Dict[int, List[Dict]]: mapping cluster_id -> list of sentence dicts
+        Dict[int, List[Dict]] mapping cluster ID to list of sentences
     """
-    logger.info("Clustering sentences into topics with embeddings + HDBSCAN")
-
     if not sentences:
-        logger.warning("No sentences provided for clustering")
         return {}
 
-    # 1. Encode sentences
-    encoder = SentenceTransformer(EMBEDDING_MODEL)
-    texts = [s["text"] for s in sentences]
-    embeddings = encoder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    model_name = embedding_model or "all-MiniLM-L6-v2"
+    logger.info("Embedding %d sentences with model: %s", len(sentences), model_name)
+    encoder = SentenceTransformer(model_name)
 
-    # 2. Importance filtering (drop filler sentences)
-    centroid = np.mean(embeddings, axis=0)
-    scores = util.cos_sim(embeddings, centroid.reshape(1, -1)).cpu().numpy().flatten()
-    threshold = np.percentile(scores, 20)  # keep top 60%
-    keep_idxs = [i for i, s in enumerate(scores) if s >= threshold]
+    texts = [str(s.get("text", "")).strip() for s in sentences]
+    embeddings = encoder.encode(texts, show_progress_bar=False, convert_to_numpy=True)
 
-    if not keep_idxs:
-        logger.warning("No sentences passed importance filter")
-        return {}
-
-    kept_sentences = [sentences[i] for i in keep_idxs]
-    kept_emb = embeddings[keep_idxs]
-
-    # 3. HDBSCAN clustering (adaptive #topics, no fixed k)
+    # HDBSCAN
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=2,
-        min_samples=1,
-        metric="euclidean"
+        min_cluster_size=min_cluster_size,
+        metric="cosine",
+        cluster_selection_method="eom"
     )
-    labels = clusterer.fit_predict(kept_emb)
+    labels = clusterer.fit_predict(embeddings)
 
-    # 4. Group into clusters, drop noise (-1)
-    clusters = {}
-    for idx, lbl in enumerate(labels):
-        if lbl == -1:
+    clusters: Dict[int, List[Dict]] = {}
+    for idx, label in enumerate(labels):
+        if label == -1:  # noise
             continue
-        clusters.setdefault(lbl, []).append(kept_sentences[idx])
+        if label not in clusters:
+            clusters[label] = []
+        clusters[label].append(sentences[idx])
 
-    # 5. Sort sentences in each cluster by time
-    for lbl in clusters:
-        clusters[lbl] = sorted(clusters[lbl], key=lambda x: x["start"])
+    if not clusters:
+        logger.warning("No clusters found (all noise)")
+        return {}
 
-    logger.info(f"Found {len(clusters)} topic clusters after filtering")
-    return clusters
+    # optional: filter out tiny clusters by text length percentile
+    if keep_percentile and keep_percentile > 0.0:
+        # compute total length per cluster
+        lengths = {cid: sum(len(s["text"].split()) for s in segs) for cid, segs in clusters.items()}
+        if lengths:
+            vals = np.array(list(lengths.values()))
+            threshold = np.percentile(vals, keep_percentile)
+            clusters = {cid: segs for cid, segs in clusters.items() if lengths[cid] >= threshold}
+            logger.info("Filtered clusters below %s percentile; kept %d clusters", keep_percentile, len(clusters))
+
+    # sort clusters by earliest start time
+    sorted_clusters = dict(sorted(clusters.items(), key=lambda kv: kv[1][0].get("start", 0.0)))
+    logger.info("cluster_topics -> %d clusters found", len(sorted_clusters))
+    return sorted_clusters
