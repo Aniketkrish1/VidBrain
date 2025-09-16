@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VidBrain · AI Video Summarizer</title>
+    <link rel="stylesheet" href="/static/css/styles.css" />
+  </head>
+  <body>
+    <header class="container header">
+      <div class="brand">
+        <div class="logo">VB</div>
+        <div>
+          <h1>VidBrain</h1>
+          <p>Create smart summaries from YouTube videos</p>
+        </div>
+      </div>
+      <nav>
+        <a href="#how">How it works</a>
+        <a href="#start">Start</a>
+        <a href="https://github.com" target="_blank" rel="noreferrer">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="container">
+          <h2>From long videos to concise, voiceover summaries</h2>
+          <p>Paste a YouTube URL and let AI transcribe, cluster topics, summarize, and produce an audio‑narrated recap.</p>
+        </div>
+      </section>
+
+      <section id="start" class="container card">
+        <h3>Start a new summary</h3>
+        <form id="startForm">
+          <div class="grid">
+            <label>
+              <span>YouTube URL</span>
+              <input type="url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." required />
+            </label>
+            <label>
+              <span>Whisper model (optional)</span>
+              <input type="text" name="whisper_model" placeholder="base | small | medium | large" />
+            </label>
+            <label>
+              <span>spaCy model (optional)</span>
+              <input type="text" name="spacy_model" placeholder="en_core_web_sm" />
+            </label>
+            <label>
+              <span>Output filename (optional)</span>
+              <input type="text" name="output_name" placeholder="summary.mp4" />
+            </label>
+          </div>
+          <button type="submit" class="btn">Create Summary</button>
+        </form>
+
+        <div id="job" class="job hidden">
+          <div class="progress"><div class="bar" id="bar" style="width:0%"></div></div>
+          <p id="status">Queued…</p>
+          <div id="result" class="hidden"></div>
+        </div>
+      </section>
+
+      <section id="how" class="container muted">
+        <h3>How it works</h3>
+        <ol>
+          <li>Download video and extract audio</li>
+          <li>Transcribe with Whisper</li>
+          <li>Segment sentences and build transcript + vector DB</li>
+          <li>Cluster topics and generate summaries</li>
+          <li>Create TTS voiceovers and assemble the final video</li>
+        </ol>
+      </section>
+    </main>
+
+    <footer class="container footer">
+      <span>© <script>document.write(new Date().getFullYear())</script> VidBrain</span>
+    </footer>
+
+    <script src="/static/js/app.js"></script>
+  </body>
+  </html>
+
+
