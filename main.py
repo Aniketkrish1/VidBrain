@@ -246,6 +246,14 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
         db.build(segments_for_db)
     except Exception as e:
         logger.warning("VectorDB build warning: %s", e)
+        # If build failed, make sure we don't accidentally use an older/stale DB that
+        # was loaded from disk earlier. Clear embeddings and metadata so searches
+        # will return no hits and the pipeline will fall back to clustering.
+        try:
+            db.embeddings = None
+            db.metadata = []
+        except Exception:
+            pass
 
     # 3) Determine clusters (either via query retrieval or automatic clustering)
     if query and query.strip():

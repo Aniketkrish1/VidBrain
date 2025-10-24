@@ -46,16 +46,30 @@ class VectorDB:
         texts = [seg["text"] for seg in segments]
         embeddings = self.model.encode(texts, convert_to_tensor=True, device=self.device)
 
+        # Ensure start/end are numeric floats in metadata
+        for seg in segments:
+            try:
+                seg["start"] = float(seg.get("start", 0.0))
+            except Exception:
+                seg["start"] = 0.0
+            try:
+                seg["end"] = float(seg.get("end", seg["start"]))
+            except Exception:
+                seg["end"] = seg["start"]
+
         self.embeddings = embeddings
         self.metadata = segments
         self.save()
 
     def save(self):
         with open(self.db_path, "wb") as f:
-            pickle.dump(
-                {"embeddings": self.embeddings.cpu(), "metadata": self.metadata},
-                f
-            )
+            data = {"embeddings": None, "metadata": self.metadata}
+            if self.embeddings is not None:
+                try:
+                    data["embeddings"] = self.embeddings.cpu()
+                except Exception:
+                    data["embeddings"] = self.embeddings
+            pickle.dump(data, f)
 
     def load(self):
         with open(self.db_path, "rb") as f:
@@ -64,16 +78,21 @@ class VectorDB:
             self.metadata = data["metadata"]
 
     def search(self, query, top_k=5):
+        # If embeddings are not built/loaded, return no results so caller falls back
+        # to clustering logic.
+        if self.embeddings is None:
+            return []
+
         query_emb = self.model.encode([query], convert_to_tensor=True, device=self.device)
         scores = torch.nn.functional.cosine_similarity(query_emb, self.embeddings)
-        topk = torch.topk(scores, k=top_k)
+        topk = torch.topk(scores, k=min(top_k, self.embeddings.size(0)))
 
         results = []
         for idx, score in zip(topk.indices.tolist(), topk.values.tolist()):
             results.append({
                 "text": self.metadata[idx]["text"],
-                "start": self.metadata[idx]["start"],
-                "end": self.metadata[idx]["end"],
+                "start": float(self.metadata[idx]["start"]),
+                "end": float(self.metadata[idx]["end"]),
                 "score": float(score)
             })
         return results

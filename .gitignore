@@ -26,3 +26,12 @@ cache/
 vector_db.pkl
 temp-audio.m4a
 optimized_video_condenser.py
+__pycache__/
+temp-audio.wav
+temp-audio.mp3
+tools/
+vector_db.pkl
+temp.py
+outputs/
+te
+

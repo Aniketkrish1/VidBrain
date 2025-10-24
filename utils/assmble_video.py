@@ -7,9 +7,6 @@ from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
-
-
-
 def assemble_video(
     video_path: str,
     topic_clusters: Dict[int, List[Dict]],
