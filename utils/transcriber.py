@@ -1,5 +1,5 @@
 from faster_whisper import WhisperModel
-from typing import Dict, List
+from typing import Dict, List, Optional
 import os
 import datetime
 from dotenv import load_dotenv
@@ -72,7 +72,7 @@ def build_srt(sentences: List[Dict]) -> str:
     return "\n".join(srt_lines)
 
 
-def transcribe_audio(audio_path: str) -> Dict:
+def transcribe_audio(audio_path: str, whisper_model: Optional[str] = None) -> Dict:
     """
     Transcribe audio using Faster-Whisper with word-level timestamps.
     Returns:
@@ -83,7 +83,13 @@ def transcribe_audio(audio_path: str) -> Dict:
         }
     """
     try:
-        model = WhisperModel(whisper_model, device="cuda", compute_type="float16")
+        model_name = whisper_model or os.getenv("WHISPER_MODEL") or "base"
+        # Check if CUDA is available
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
         segments, info = model.transcribe(
             audio_path,

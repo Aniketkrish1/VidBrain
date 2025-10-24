@@ -24,10 +24,10 @@ load_dotenv()
 
 # media libs
 import torch
-from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
+from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips
 
-# TTS: use your existing TTS (Coqui TTS imported below). If your environment uses a different TTS, swap accordingly.
-from TTS.api import TTS
+# TTS: use pyttsx3 for cross-platform compatibility
+import pyttsx3
 
 # local utils (assumed present)
 from utils import topic_clustering as tc
@@ -36,11 +36,17 @@ from utils import transcriber as tb
 from utils import summarizer as sz
 from utils.database import VectorDB, parse_srt
 from utils import scene_detector as sd
+from utils.assmble_video import assemble_video
+from utils.topic_query_processor import process_topic_query, extract_timestamps_from_groups
+from utils.clip_extractor import prepare_clips_for_topic
+from utils.voiceover_generator import generate_voiceover
+from utils.video_assembler import assemble_topic_video
 
 # ==== CONFIG ====
 TEMP_DIR = os.getenv("TEMP_DIR", "temp_processing")
 OUTPUT_VIDEO_NAME = os.getenv("OUTPUT_VIDEO_NAME", "summary_output.mp4")
-TTS_MODEL = os.getenv("TTS_MODEL", "tts_models/en/ljspeech/tacotron2-DDC")
+# TTS_MODEL not used with pyttsx3, but keeping for compatibility
+TTS_MODEL = os.getenv("TTS_MODEL", "default")
 EMBEDDING_DB_PATH = os.getenv("VECTOR_DB_PATH", "vector_db.pkl")
 KEEP_CLUSTER_PERCENTILE = float(os.getenv("KEEP_CLUSTER_PERCENTILE", "10.0"))
 MIN_CLUSTER_SIZE = int(os.getenv("MIN_CLUSTER_SIZE", "2"))
@@ -73,9 +79,24 @@ def retrieve_by_query(db: VectorDB, query: str, top_k: int = 50) -> List[Dict]:
     Expected that db.search returns list of dicts with keys: 'text','start','end','score' (score optional).
     """
     hits = db.search(query, top_k=top_k)  # adjust per your VectorDB API
+
+    # Filter hits to only include those that are highly relevant to the specific query
+    # Keep only hits with score above a threshold and that contain query keywords
+    query_lower = query.lower()
+    filtered_hits = []
+    for h in hits:
+        score = h.get("score", 0)
+        text = h.get("text", "").lower()
+
+        # Keep hits with high similarity score OR that contain the query terms
+        if score > 0.3 or query_lower in text:
+            filtered_hits.append(h)
+
+    logger.info(f"Query '{query}': found {len(hits)} total hits, {len(filtered_hits)} after filtering")
+
     # ensure shape
     result = []
-    for h in hits:
+    for h in filtered_hits:
         # handle both dict and tuple shaped returns
         if isinstance(h, dict):
             text = h.get("text") or h.get("content") or ""
@@ -126,96 +147,86 @@ def generate_voiceovers_from_summaries(summaries: Dict[int, Dict], tts_model: st
     Returns: {cluster_id: audio_path}
     """
     logger.info("Starting TTS generation for %d summaries", len(summaries))
-    tts = TTS(model_name=tts_model, progress_bar=False, gpu=torch.cuda.is_available())
     out = {}
+
     for cid, data in summaries.items():
         summary_text = data.get("summary", "")
         if not summary_text:
             logger.warning("Empty summary for cluster %s, skipping TTS", cid)
             continue
-        file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.wav")
+
+        file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.mp3")
+        logger.info(f"Generating TTS for cluster {cid}: {len(summary_text)} chars")
+
         try:
-            tts.tts_to_file(text=summary_text, file_path=file_path)
-            out[cid] = file_path
-            logger.info("TTS written for cluster %s -> %s", cid, file_path)
+            # Create a new engine instance for each cluster to avoid issues
+            engine = pyttsx3.init()
+            # Configure voice settings
+            voices = engine.getProperty('voices')
+            if voices:
+                # Try to use a female voice if available, otherwise use default
+                for voice in voices:
+                    if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
+                        engine.setProperty('voice', voice.id)
+                        break
+
+            engine.setProperty('rate', 180)  # Speed of speech
+            engine.setProperty('volume', 0.9)  # Volume level (0.0 to 1.0)
+
+            # Generate TTS for this cluster
+            engine.save_to_file(summary_text, file_path)
+            engine.runAndWait()
+            engine.stop()
+
+            # Verify the file was created
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                out[cid] = file_path
+                logger.info("TTS completed for cluster %s -> %s (%.1f KB)",
+                           cid, file_path, os.path.getsize(file_path) / 1024)
+            else:
+                logger.error("TTS file not created or empty for cluster %s", cid)
+
         except Exception as e:
             logger.error("TTS failed for cluster %s: %s", cid, e)
+            # Try to clean up any partial file
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+
+        finally:
+            # Ensure engine is properly closed
+            try:
+                engine.stop()
+                del engine
+            except:
+                pass
+
+    logger.info("TTS generation completed: %d/%d voiceovers created", len(out), len(summaries))
     return out
 
-# ==== assemble (uses summaries dict) ====
-def assemble_from_summaries(video_path: str, summaries: Dict[int, Dict], voiceover_paths: Dict[int, str], output_path: str) -> str:
-    logger.info("Assembling final video using %d summaries", len(summaries))
-    original = None
-    segments = []
-    try:
-        original = VideoFileClip(video_path)
-        duration = original.duration
-        for cid in sorted(summaries.keys()):
-            data = summaries[cid]
-            start = float(data.get("start", 0.0))
-            end = data.get("end", None)
-            end = normalize_end(end, duration)
-
-            if end <= start:
-                logger.warning("Cluster %s has non-positive duration (%s-%s), skipping", cid, start, end)
-                continue
-
-            voice_path = voiceover_paths.get(cid)
-            if not voice_path or not os.path.exists(voice_path):
-                raise FileNotFoundError(f"Voiceover for cluster {cid} not found: {voice_path}")
-
-            logger.info("Cutting cluster %s: %.2f - %.2f", cid, start, end)
-            clip = original.subclip(start, end)
-            audio_clip = AudioFileClip(voice_path)
-
-            # sync durations
-            if audio_clip.duration < clip.duration:
-                clip = clip.subclip(0, audio_clip.duration)
-            elif audio_clip.duration > clip.duration:
-                clip = clip.loop(duration=audio_clip.duration)
-
-            clip = clip.set_audio(audio_clip)
-            segments.append(clip)
-
-        if not segments:
-            raise RuntimeError("No segments to concatenate; nothing to assemble.")
-
-        final = concatenate_videoclips(segments, method="compose")
-        final.write_videofile(output_path, codec="libx264", audio_codec="aac",
-                              temp_audiofile=os.path.join(TEMP_DIR, "temp-audio.m4a"),
-                              remove_temp=True, verbose=False, logger=None)
-
-        logger.info("Wrote final video: %s", output_path)
-        return output_path
-
-    finally:
-        # try to close everything to release handles
-        try:
-            if original:
-                original.close()
-        except Exception:
-            pass
-        for s in segments:
-            try:
-                s.close()
-            except Exception:
-                pass
-        gc.collect()
-
 # ==== pipeline entry point ====
-def process_video(video_path: Optional[str], youtube_url: Optional[str], query: Optional[str], output_path: str):
+def process_video(video_path: Optional[str], youtube_url: Optional[str], query: Optional[str], output_path: str, whisper_model: Optional[str] = None, progress_callback: Optional[callable] = None, summaries_callback: Optional[callable] = None):
     """
     If youtube_url provided -> download video -> set video_path accordingly.
     If video_path provided -> use it.
     query: optional user query string (topic to extract); if None, auto-detect topics (clustering)
     """
+    def update_progress(stage: str, percent: int, details: str = ""):
+        if progress_callback:
+            progress_callback(stage, percent, details)
+        logger.info(f"Progress: {stage} - {percent}% - {details}")
+
     setup_dirs()
 
     # 1) Download or use local
+    update_progress("download", 5, "Starting video download...")
     if youtube_url:
         try:
             logger.info("Downloading video from URL")
             video_path, audio_path = dl.download_and_extract_audio(youtube_url)
+            update_progress("download", 15, "Video downloaded successfully")
         except Exception as e:
             logger.error("Download failed: %s", e)
             raise
@@ -226,71 +237,192 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
         if not os.path.exists(audio_path):
             import subprocess
             subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", audio_path], check=False)
+        update_progress("download", 15, "Using local video file")
     else:
         raise ValueError("Either video_path or youtube_url must be provided")
 
     # 2) Transcribe
+    update_progress("transcription", 20, "Starting audio transcription...")
     logger.info("Transcribing audio")
-    trans_data = tb.transcribe_audio(audio_path)
+    trans_data = tb.transcribe_audio(audio_path, whisper_model)
     # trans_data expected: { "sentences": [ {"text","start","end","words"}, ... ], "srt": "...", "language": "en" }
     sentences = trans_data.get("sentences", [])
     if not sentences:
         raise RuntimeError("Transcription produced no sentences")
+    update_progress("transcription", 35, f"Transcription completed - {len(sentences)} sentences")
 
     # Build / load vector DB
+    update_progress("vectordb", 40, "Building vector database...")
     logger.info("Building or loading vector DB")
     db = VectorDB(db_path=EMBEDDING_DB_PATH)
     # Build expects segments list - adapt parse_srt or sentences shape as required
     try:
         segments_for_db = [ {"text": s["text"], "start": s["start"], "end": s["end"]} for s in sentences ]
         db.build(segments_for_db)
+        update_progress("vectordb", 45, "Vector database built")
     except Exception as e:
         logger.warning("VectorDB build warning: %s", e)
 
     # 3) Determine clusters (either via query retrieval or automatic clustering)
+    update_progress("clustering", 50, "Analyzing topics and clustering...")
+    
+    # NEW: Topic-based query workflow
     if query and query.strip():
-        logger.info("User query provided; retrieving relevant transcript segments")
-        hits = retrieve_by_query(db, query, top_k=5)
-        if not hits:
-            logger.warning("No results from vector DB for query; falling back to clustering entire transcript")
-            topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
+        logger.info(f"Processing topic query: '{query}'")
+        update_progress("query_processing", 52, f"Searching for: {query}")
+        
+        # Use new topic query processor
+        query_result = process_topic_query(db, query, sentences)
+        
+        if not query_result or not query_result.get("segments"):
+            logger.warning("No results from topic query; falling back to clustering")
+            topic_clusters = tc.cluster_topics(sentences, embedding_model=None, 
+                                             min_cluster_size=MIN_CLUSTER_SIZE, 
+                                             keep_percentile=KEEP_CLUSTER_PERCENTILE)
+            summary_text = ""
         else:
-            # merge temporally proximate hits into groups; this keeps explanation parts separated by filler merged
-            groups = merge_adjacent_segments(hits, gap_threshold=3.0)
-            topic_clusters = make_topic_clusters_from_db_hits(groups)
+            # Extract data from query result
+            summary_text = query_result.get("summary", "")
+            segment_groups = query_result.get("groups", [])
+            
+            logger.info(f"Topic query successful: {len(segment_groups)} segment groups found")
+            update_progress("query_processing", 58, f"Found {len(segment_groups)} relevant segments")
+            
+            # Store summary for later use
+            if summaries_callback:
+                summaries_callback([{
+                    "cluster_id": 0,
+                    "summary": summary_text,
+                    "start": segment_groups[0][0]["start"] if segment_groups and segment_groups[0] else 0,
+                    "end": segment_groups[-1][-1]["end"] if segment_groups and segment_groups[-1] else 0,
+                    "query": query
+                }])
+            
+            # Prepare clips from relevant segments
+            update_progress("clip_extraction", 60, "Extracting relevant video clips...")
+            
+            clips_data = prepare_clips_for_topic(
+                video_path, 
+                segment_groups, 
+                output_dir=TEMP_DIR,
+                min_clip_duration=2.0
+            )
+            
+            clip_paths = clips_data.get("clips", [])
+            logger.info(f"Extracted {len(clip_paths)} video clips")
+            update_progress("clip_extraction", 70, f"Extracted {len(clip_paths)} clips")
+            
+            if not clip_paths:
+                raise RuntimeError("No video clips could be extracted for the topic")
+            
+            # Generate voiceover from summary
+            update_progress("voiceover", 75, "Generating voiceover from summary...")
+            
+            voiceover_path = os.path.join(TEMP_DIR, "topic_voiceover.mp3")
+            try:
+                generate_voiceover(summary_text, voiceover_path, engine="auto")
+                logger.info(f"Voiceover generated: {voiceover_path}")
+            except Exception as e:
+                logger.error(f"Voiceover generation failed: {e}")
+                raise RuntimeError(f"Failed to generate voiceover: {e}")
+            
+            update_progress("voiceover", 85, "Voiceover generated successfully")
+            
+            # Assemble final video
+            update_progress("assembly", 90, "Assembling final video...")
+            
+            try:
+                final = assemble_topic_video(
+                    clip_paths=clip_paths,
+                    voiceover_path=voiceover_path,
+                    output_path=output_path,
+                    adjust_speed=True
+                )
+                logger.info(f"Final video assembled: {final}")
+            except Exception as e:
+                logger.error(f"Video assembly failed: {e}")
+                raise RuntimeError(f"Failed to assemble video: {e}")
+            
+            update_progress("assembly", 100, f"Topic video created successfully: {query}")
+            
+            # Cleanup
+            cleanup()
+            logger.info("Topic-based pipeline finished successfully")
+            return final
+    
+    # FALLBACK: Original clustering workflow (no query)
     else:
         logger.info("No query: clustering entire transcript")
-        topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
+        topic_clusters = tc.cluster_topics(sentences, embedding_model=None, 
+                                         min_cluster_size=MIN_CLUSTER_SIZE, 
+                                         keep_percentile=KEEP_CLUSTER_PERCENTILE)
 
     if not topic_clusters:
         raise RuntimeError("No topic clusters found after retrieval/clustering")
 
     logger.info("Clusters prepared: %d", len(topic_clusters))
+    update_progress("clustering", 55, f"Found {len(topic_clusters)} topic clusters")
 
     # 4) Scene detection (GPU-accelerated ffmpeg hybrid)
+    update_progress("scenes", 60, "Detecting video scenes...")
     scenes = sd.detect_scenes(video_path)
     # scenes is list of (start,end) where end may be None for last segment
+    update_progress("scenes", 65, f"Detected {len(scenes)} video scenes")
 
     # 5) Summarize clusters (classification + summarization; returns cluster_id -> {summary,start,end,sentences})
     # pass video duration so summarizer can normalize None -> duration
     with VideoFileClip(video_path) as v:
         video_duration = v.duration
 
+    update_progress("summarization", 70, "Generating AI summaries...")
     summaries = sz.summarize_topics(topic_clusters, scenes, video_duration=video_duration, require_classification=True, use_openrouter=True)
 
     if not summaries:
         raise RuntimeError("Summarizer returned no summaries (all clusters filtered)")
 
+    update_progress("summarization", 75, f"Generated {len(summaries)} summaries")
+
+    # Store summaries for frontend display
+    if summaries_callback:
+        summary_list = []
+        for cid, data in summaries.items():
+            summary_list.append({
+                "cluster_id": int(cid),
+                "summary": data.get("summary", ""),
+                "start": data.get("start", 0),
+                "end": data.get("end", 0)
+            })
+        summaries_callback(summary_list)
+
     # 6) TTS generation
+    update_progress("tts", 80, "Generating voiceovers...")
     voiceover_paths = generate_voiceovers_from_summaries(summaries, tts_model=TTS_MODEL)
 
     # sanity check
     missing = [cid for cid in summaries.keys() if cid not in voiceover_paths]
     if missing:
         logger.warning("Missing voiceovers for clusters: %s", missing)
+        update_progress("tts", 85, f"Generated {len(voiceover_paths)}/{len(summaries)} voiceovers")
+
+    update_progress("tts", 90, f"All {len(voiceover_paths)} voiceovers generated")
 
     # 7) Assemble condensed video
-    final = assemble_from_summaries(video_path, summaries, voiceover_paths, output_path)
+    update_progress("assembly", 95, "Assembling final video...")
+
+    # Convert summaries format to topic_clusters format expected by assemble_video
+    topic_clusters_for_assembly = {}
+    for cid, summary_data in summaries.items():
+        if cid in voiceover_paths:  # Only include clusters that have voiceovers
+            topic_clusters_for_assembly[cid] = summary_data["sentences"]
+
+    if not topic_clusters_for_assembly:
+        raise RuntimeError("No voiceovers generated - cannot assemble video")
+
+    logger.info("Assembling video with %d clusters (out of %d summaries)",
+               len(topic_clusters_for_assembly), len(summaries))
+
+    final = assemble_video(video_path, topic_clusters_for_assembly, voiceover_paths, output_path)
+    update_progress("assembly", 100, f"Final video saved to {final}")
 
     # 8) cleanup
     cleanup()

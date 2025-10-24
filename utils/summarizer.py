@@ -21,13 +21,24 @@ logger.setLevel(logging.INFO)
 from openai import OpenAI
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-CLASSIFY_MODEL = os.getenv("OPENROUTER_CLASSIFY_MODEL", "nvidia/nemotron-nano-9b-v2:free")
-SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "nvidia/nemotron-nano-9b-v2:free")
+CLASSIFY_MODEL = os.getenv("OPENROUTER_CLASSIFY_MODEL", "qwen/qwen3-vl-32b-instruct")
+SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "qwen/qwen3-vl-32b-instruct")
 USE_OPENROUTER = bool(OPENROUTER_API_KEY)
+
+# Validate configuration
+if not OPENROUTER_API_KEY:
+    logger.warning("OPENROUTER_API_KEY not found - will use local summarization")
+else:
+    logger.info(f"OpenRouter configured with models - Classify: {CLASSIFY_MODEL}, Summarize: {SUMMARIZE_MODEL}")
 
 _client = None
 if USE_OPENROUTER:
-    _client = OpenAI(base_url=OPENROUTER_BASE, api_key=OPENROUTER_API_KEY)
+    _client = OpenAI(
+        base_url=OPENROUTER_BASE, 
+        api_key=OPENROUTER_API_KEY,
+        timeout=30.0,
+        max_retries=2
+    )
 
 # local summarizer fallback
 _local_summarizer = None
@@ -97,10 +108,10 @@ def _classify_cluster_openrouter(cluster_text: str) -> Tuple[bool, str]:
 
 def _summarize_cluster_openrouter(cluster_text: str) -> str:
     prompt = (
-        "Rewrite the following transcript into a concise, clear, and complete educational explanation. "
+        "Rewrite the following transcript into a concise, clear, and complete educational explanation focused on the main topic. "
         "Keep technical terms, steps and examples. Make it substantially shorter than the original but "
-        "preserve the meaning and the example (i.e., a viewer should understand and be able to apply the concept). "
-        "Output 3-6 short sentences suitable for a 2-3 minute spoken voiceover.\n\n"
+        "preserve the core meaning and key examples (i.e., a viewer should understand and be able to apply the concept). "
+        "Output 2-4 short sentences suitable for a 1-2 minute spoken voiceover. Focus only on the main topic discussed.\n\n"
         "TRANSCRIPT:\n" + cluster_text
     )
     content = _safe_openrouter_call(SUMMARIZE_MODEL, [{"role":"user","content":prompt}])
