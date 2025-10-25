@@ -14,15 +14,16 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
 
-load_dotenv()
+# Force reload environment variables to get latest API key
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
-# OpenRouter configuration
+# OpenRouter configuration - reload API key each time
 from openai import OpenAI
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "qwen/qwen3-vl-32b-instruct")
+SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "qwen/qwen-2.5-72b-instruct")  # More reliable model
 
 # Validate API key
 if not OPENROUTER_API_KEY:
@@ -39,6 +40,33 @@ if OPENROUTER_API_KEY:
         timeout=30.0,  # 30 second timeout
         max_retries=2   # Only retry twice
     )
+
+
+def refresh_openrouter_client():
+    """
+    Refresh the OpenRouter client with the latest API key from environment.
+    Call this if you've updated the .env file and need to reload the API key.
+    """
+    global _client, OPENROUTER_API_KEY, SUMMARIZE_MODEL
+    
+    # Reload environment variables
+    load_dotenv(override=True)
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+    SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "qwen/qwen3-vl-32b-instruct")
+    
+    if OPENROUTER_API_KEY:
+        _client = OpenAI(
+            base_url=OPENROUTER_BASE, 
+            api_key=OPENROUTER_API_KEY,
+            timeout=30.0,
+            max_retries=2
+        )
+        logger.info(f"OpenRouter client refreshed with new API key (starts with: {OPENROUTER_API_KEY[:15]}...)")
+        return True
+    else:
+        _client = None
+        logger.warning("No OpenRouter API key found after refresh")
+        return False
 
 
 def search_topic_in_transcript(db, query: str, top_k: int = 20) -> List[Dict]:
@@ -74,22 +102,33 @@ def search_topic_in_transcript(db, query: str, top_k: int = 20) -> List[Dict]:
         keyword_boost = 0.0
         for keyword in query_keywords:
             if keyword in text_lower:
-                keyword_boost += 0.1
+                keyword_boost += 0.15  # Increase boost for keyword matches
         
         # Update score with boost
         hit["score"] = min(1.0, score + keyword_boost)
         
-        # Keep high-relevance segments or those containing query keywords
-        if hit["score"] > 0.25 or any(keyword in text_lower for keyword in query_keywords):
+        # IMPROVED FILTERING: Only keep segments that are actually relevant
+        # 1. High vector similarity score (>0.3)
+        # 2. OR contains query keywords
+        # 3. AND text is substantial (>20 characters)
+        text_length_ok = len(hit.get("text", "")) > 20
+        has_keywords = any(keyword in text_lower for keyword in query_keywords)
+        high_similarity = hit["score"] > 0.3
+        
+        if text_length_ok and (high_similarity or has_keywords):
             filtered_hits.append(hit)
     
-    # Sort by score (highest first) to get best matches at top
+    # Sort by score (highest first) and take only the most relevant
     filtered_hits = sorted(filtered_hits, key=lambda x: x["score"], reverse=True)
     
-    logger.info(f"Found {len(filtered_hits)} relevant segments (from {len(hits)} total hits)")
-    logger.info(f"Top segment score: {filtered_hits[0]['score']:.2f}, Bottom segment score: {filtered_hits[-1]['score']:.2f}")
+    # IMPROVED: Take only top 5-8 most relevant segments instead of all
+    top_segments = filtered_hits[:8]
     
-    return filtered_hits
+    logger.info(f"Found {len(top_segments)} relevant segments (from {len(hits)} total hits)")
+    if top_segments:
+        logger.info(f"Top segment score: {top_segments[0]['score']:.2f}, Bottom segment score: {top_segments[-1]['score']:.2f}")
+    
+    return top_segments
 
 
 def merge_adjacent_segments(segments: List[Dict], gap_threshold: float = 3.0) -> List[List[Dict]]:
@@ -286,103 +325,302 @@ Summary:"""
     return {"summary": "Could not generate summary", "timestamps": [], "confidence": 0}
 
 
-def process_topic_query(db, query: str, sentences: List[Dict]) -> Dict:
+def process_topic_query_enhanced(query: str, transcript: List[Dict], srt_content: str, db_path: str) -> Dict:
     """
-    Main function to process a topic query and prepare data for video generation.
-    NOW USES FULL TRANSCRIPT for better AI understanding.
+    ENHANCED APPROACH: Build vector database and use focused search.
     
     Args:
-        db: VectorDB instance
-        query: User query (e.g., "explain quick sort")
-        sentences: Full transcript sentences with timestamps
+        query: User query (e.g., "merge sort", "bubble sort")  
+        transcript: List of transcript segments with timestamps
+        srt_content: SRT format content for building database
+        db_path: Path to save/load vector database
     
     Returns:
         Dictionary with:
-        - summary: AI-generated summary from full transcript
+        - summary: AI-generated summary from relevant segments only
         - segments: List of relevant segments with timestamps
-        - groups: Merged segment groups
+        - confidence: AI confidence level
         - query: Original query
     """
-    logger.info(f"Processing topic query: '{query}'")
+    from .database import VectorDB, parse_srt_content
     
-    # 1. Search for relevant segments using vector similarity (sorted by score)
+    logger.info(f"🎯 Enhanced topic query processing: '{query}'")
+    
+    # 1. Build/load vector database with SRT content
+    logger.info("Building vector database from SRT content...")
+    try:
+        db = VectorDB(db_path=db_path)
+        
+        # Parse SRT content to get segments for database
+        srt_segments = parse_srt_content(srt_content)
+        if not srt_segments:
+            logger.warning("No segments parsed from SRT, using transcript segments")
+            srt_segments = [{"text": s["text"], "start": s["start"], "end": s["end"]} for s in transcript]
+        
+        # Build database
+        db.build(srt_segments)
+        logger.info(f"✅ Vector database built with {len(srt_segments)} segments")
+        
+    except Exception as e:
+        logger.error(f"Vector database error: {e}")
+        return {
+            "summary": f"Error building search database: {e}",
+            "segments": [],
+            "confidence": 0,
+            "query": query
+        }
+    
+    # 2. Search for relevant segments
+    logger.info(f"🔍 Searching for segments related to '{query}'...")
     relevant_segments = search_topic_in_transcript(db, query, top_k=15)
     
     if not relevant_segments:
-        logger.warning(f"Vector search found no relevant segments for: {query}")
-        # Still try with full transcript - AI might find it
-        relevant_segments = []
+        logger.warning(f"No relevant segments found for: {query}")
+        return {
+            "summary": f"The topic '{query}' was not found in this video.",
+            "segments": [],
+            "confidence": 0,
+            "query": query
+        }
     
-    # Keep a copy sorted by relevance for summary generation
-    segments_by_relevance = relevant_segments.copy()
+    # 3. Generate focused summary
+    focused_transcript = " ".join([seg.get("text", "").strip() for seg in relevant_segments])
+    logger.info(f"📝 Focused transcript: {len(focused_transcript)} chars from {len(relevant_segments)} segments")
     
-    # Sort by timestamp for video clip extraction (chronological order)
-    relevant_segments_chronological = sorted(relevant_segments, key=lambda x: x["start"])
-    
-    # 2. Build full transcript text from ALL sentences
-    full_transcript = " ".join([sent.get("text", "").strip() for sent in sentences])
-    
-    logger.info(f"Full transcript: {len(full_transcript)} chars, {len(sentences)} sentences")
-    
-    # 3. Generate summary from FULL TRANSCRIPT (not just segments!)
-    # This gives AI complete context to understand and explain the query
-    # Pass segments sorted by relevance (best matches first)
-    summary_result = generate_summary_from_full_transcript(
-        full_transcript, 
+    # 4. Generate AI summary from relevant segments only
+    summary_result = generate_focused_summary_from_segments(
+        focused_transcript, 
         query, 
-        segments_by_relevance  # Use relevance-sorted segments for better fallback
+        relevant_segments
     )
     
     summary = summary_result.get("summary", "")
     confidence = summary_result.get("confidence", 0)
-    is_rate_limited = summary_result.get("rate_limited", False)
     is_error = summary_result.get("error", False)
     
-    # Check if it's a rate limit or API error (but we have segments)
-    if is_rate_limited or is_error:
-        if segments_by_relevance:
-            logger.warning(f"API issue, but continuing with {len(segments_by_relevance)} segments found")
-            # Continue processing with segments even if summary is fallback
+    if is_error:
+        logger.error(f"Summary generation failed for query: {query}")
+        # Fallback to concatenated segment text  
+        summary = focused_transcript[:500] + "..." if len(focused_transcript) > 500 else focused_transcript
+        confidence = 30
+    
+    # Filter segments to ensure good confidence
+    if confidence < 50:
+        logger.info(f"Low confidence ({confidence}%), filtering segments...")
+        # Keep only highly relevant segments
+        filtered_segments = []
+        query_words = set(query.lower().split())
+        for seg in relevant_segments:
+            seg_words = set(seg.get("text", "").lower().split())
+            if query_words.intersection(seg_words) or len(seg_words.intersection(query_words)) > 0:
+                filtered_segments.append(seg)
+        
+        if filtered_segments:
+            relevant_segments = filtered_segments[:8]  # Limit to top 8
+            confidence = min(85, confidence + 20)  # Boost confidence slightly
+    
+    logger.info(f"✅ Enhanced approach completed: confidence={confidence}%, segments={len(relevant_segments)}")
+    
+    return {
+        "summary": summary,
+        "segments": relevant_segments,
+        "confidence": confidence,
+        "query": query
+    }
+
+
+# Alias for compatibility
+def process_topic_query(query: str = None, transcript: List[Dict] = None, srt_content: str = None, db_path: str = None, db=None, sentences: List[Dict] = None) -> Dict:
+    """
+    Compatibility wrapper that handles both old and new signatures.
+    
+    New signature: process_topic_query(query, transcript, srt_content, db_path)
+    Old signature: process_topic_query(db, query, sentences)
+    """
+    # New enhanced approach
+    if transcript is not None and srt_content is not None and db_path is not None:
+        return process_topic_query_enhanced(query, transcript, srt_content, db_path)
+    
+    # Old approach for backward compatibility
+    elif db is not None and sentences is not None:
+        return process_topic_query_old(db, query, sentences)
+    
+    else:
+        raise ValueError("Invalid arguments. Use either: process_topic_query(query, transcript, srt_content, db_path) or process_topic_query(db, query, sentences)")
+
+
+def process_topic_query_old(db, query: str, sentences: List[Dict]) -> Dict:
+    """
+    NEW IMPROVED APPROACH: Use vector search to find relevant segments,
+    then send ONLY those segments to OpenRouter for focused summarization.
+    
+    Args:
+        db: VectorDB instance with transcript embeddings
+        query: User query (e.g., "merge sort", "bubble sort")
+        sentences: Full transcript sentences with timestamps
+    
+    Returns:
+        Dictionary with:
+        - summary: AI-generated summary from relevant segments only
+        - segments: List of relevant segments with timestamps
+        - groups: Merged segment groups for video clips
+        - query: Original query
+        - confidence: AI confidence level
+    """
+    logger.info(f"Processing topic query: '{query}'")
+    
+    # 1. Use vector search to find the most relevant segments for the topic
+    logger.info(f"Searching for segments related to '{query}'...")
+    relevant_segments = search_topic_in_transcript(db, query, top_k=15)
+    
+    if not relevant_segments:
+        logger.warning(f"No relevant segments found for: {query}")
+        return {
+            "summary": f"The topic '{query}' was not found in this video.",
+            "segments": [],
+            "groups": [],
+            "query": query,
+            "confidence": 0
+        }
+    
+    # 2. Extract text from relevant segments to create focused transcript
+    focused_transcript = " ".join([seg.get("text", "").strip() for seg in relevant_segments])
+    logger.info(f"Focused transcript: {len(focused_transcript)} chars from {len(relevant_segments)} segments")
+    
+    # 3. Generate summary using ONLY the relevant segments (not full transcript)
+    summary_result = generate_focused_summary_from_segments(
+        focused_transcript, 
+        query, 
+        relevant_segments
+    )
+    
+    summary = summary_result.get("summary", "")
+    confidence = summary_result.get("confidence", 0)
+    is_error = summary_result.get("error", False)
+    
+    if is_error:
+        logger.error(f"Summary generation failed for query: {query}")
+        # Fallback to segment text
+        if relevant_segments:
+            fallback_text = " ".join([seg.get("text", "")[:100] for seg in relevant_segments[:3]])
+            summary = f"Found relevant content about '{query}': {fallback_text}..."
+            confidence = 0.3
         else:
-            logger.error(f"API error and no segments found for: {query}")
-            return {
-                "summary": summary,
-                "segments": [],
-                "groups": [],
-                "query": query
-            }
+            summary = f"Unable to generate summary for '{query}'"
+            confidence = 0
     
-    # Check if topic truly not found (confidence 0 and not an API error)
-    if confidence == 0 and not is_rate_limited and not is_error:
-        if "not covered" in summary.lower():
-            logger.error(f"Topic '{query}' not found in video")
-            return {
-                "summary": summary,
-                "segments": [],
-                "groups": [],
-                "query": query
-            }
+    # 4. Sort segments by timestamp for video clip extraction
+    relevant_segments_chronological = sorted(relevant_segments, key=lambda x: x["start"])
     
-    # 4. Merge adjacent segments for video clip extraction (use chronological order)
+    # 5. Merge adjacent segments for better video clips
     segment_groups = merge_adjacent_segments(relevant_segments_chronological, gap_threshold=4.0)
     
     if not segment_groups:
-        logger.warning("No segment groups found - using all relevant segments")
-        segment_groups = [[seg] for seg in relevant_segments_chronological] if relevant_segments_chronological else []
+        logger.warning("No segment groups - creating single group from all segments")
+        segment_groups = [relevant_segments_chronological] if relevant_segments_chronological else []
     
-    # 5. Prepare result
-    result = {
+    logger.info(f"Topic query processed: Summary={len(summary)} chars, {len(segment_groups)} clip groups, confidence={confidence}")
+    
+    return {
         "summary": summary,
-        "segments": relevant_segments_chronological,  # Return in chronological order
+        "segments": relevant_segments_chronological,
         "groups": segment_groups,
         "query": query,
+        "confidence": confidence,
         "total_segments": len(relevant_segments_chronological),
         "total_groups": len(segment_groups),
-        "confidence": confidence
+        "focused_approach": True  # Flag to indicate this used focused vector search
     }
+
+
+def generate_focused_summary_from_segments(focused_transcript: str, query: str, relevant_segments: List[Dict]) -> Dict:
+    """
+    Generate summary using OpenRouter from ONLY the relevant segments (not full transcript).
+    This creates much more focused and accurate summaries.
     
-    logger.info(f"Topic query processed successfully: {result['total_segments']} segments, {result['total_groups']} groups")
-    return result
+    Args:
+        focused_transcript: Text from only the relevant segments
+        query: User's query (e.g., "merge sort")
+        relevant_segments: List of relevant segment dicts with scores
+    
+    Returns:
+        Dictionary with summary, confidence, error status
+    """
+    if not focused_transcript:
+        logger.warning("No focused transcript to summarize")
+        return {"summary": "No relevant content found", "confidence": 0, "error": True}
+    
+    logger.info(f"Generating focused summary from {len(relevant_segments)} relevant segments for query: '{query}'")
+    
+    if not _client or not OPENROUTER_API_KEY:
+        logger.error("OpenRouter not available")
+        return {"summary": "OpenRouter API not configured", "confidence": 0, "error": True}
+    
+    try:
+        # Calculate average relevance score for confidence
+        avg_score = sum(seg.get("score", 0) for seg in relevant_segments) / len(relevant_segments)
+        
+        # Create focused prompt for relevant segments only
+        prompt = f"""You are a technical content editor. You have been given transcript segments from a video that are specifically relevant to "{query}". Create a clear, direct summary.
+
+INSTRUCTIONS:
+1. The transcript segments below are PRE-FILTERED to be relevant to "{query}"
+2. Write a DIRECT, factual summary (NO conversational phrases like "Let's dive into" or "The speaker describes")
+3. Start directly with the topic: "{query} is..." or "{query} works by..."
+4. Correct any spelling mistakes or transcription errors in the content
+5. Include key concepts, steps, and technical details from the segments
+6. Write in clear, educational language (like a textbook explanation)
+7. Length: 4-8 sentences of pure technical content
+8. Focus ONLY on explaining "{query}" based on these relevant segments
+
+RELEVANT TRANSCRIPT SEGMENTS (about "{query}"):
+{focused_transcript}
+
+---
+
+DIRECT SUMMARY (about "{query}"):"""
+
+        response = _client.chat.completions.create(
+            model=SUMMARIZE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        summary = response.choices[0].message.content.strip()
+        
+        # Calculate confidence based on segment relevance and AI response quality
+        confidence = min(0.9, 0.5 + (avg_score * 0.4))  # Base 50% + up to 40% from relevance
+        
+        if len(summary) < 50:
+            confidence *= 0.7  # Reduce confidence for very short summaries
+        
+        logger.info(f"Generated focused summary: {len(summary)} chars, confidence: {confidence:.2f}")
+        
+        return {
+            "summary": summary,
+            "confidence": confidence,
+            "error": False
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"OpenRouter focused summarization failed: {e}")
+        
+        # Check for rate limit
+        if "429" in error_msg or "rate limit" in error_msg.lower():
+            return {
+                "summary": f"Rate limit exceeded. Please try again in a few minutes.", 
+                "confidence": 0,
+                "error": True,
+                "rate_limited": True
+            }
+        
+        return {
+            "summary": f"API Error: {error_msg}", 
+            "confidence": 0,
+            "error": True
+        }
 
 
 def extract_timestamps_from_groups(groups: List[List[Dict]]) -> List[Tuple[float, float]]:

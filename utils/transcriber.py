@@ -5,7 +5,8 @@ import datetime
 from dotenv import load_dotenv
 import spacy
 
-load_dotenv()
+# Force reload environment variables to get latest settings
+load_dotenv(override=True)
 whisper_model = os.getenv("WHISPER_MODEL")
 spacy_model = os.getenv("SPACY_MODEL", "en_core_web_sm")
 

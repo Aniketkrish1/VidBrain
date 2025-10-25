@@ -8,7 +8,8 @@ from moviepy import VideoFileClip
 from dotenv import load_dotenv
 import logging
 
-load_dotenv()
+# Force reload environment variables to get latest settings
+load_dotenv(override=True)
 
 temp_dir = os.getenv("TEMP_DIR", "temp_processing")
 logger = logging.getLogger(__name__)

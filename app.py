@@ -5,6 +5,10 @@ from starlette.concurrency import run_in_threadpool
 from pathlib import Path
 import uuid, asyncio, os, logging, shutil
 
+# Load environment variables first
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 # import your main pipeline
 from main import process_video, OUTPUT_VIDEO_NAME
 

@@ -8,7 +8,8 @@ from pathlib import Path
 sys.path.append('.')
 
 from dotenv import load_dotenv
-load_dotenv()
+# Force reload environment variables to get latest API keys
+load_dotenv(override=True)
 
 def main():
     print("🎬 VidBrain Complete Video Processing")

@@ -45,7 +45,8 @@ import pickle
 import hashlib
 from dotenv import load_dotenv
 
-load_dotenv()
+# Force reload environment variables to get latest API keys
+load_dotenv(override=True)
 
 # Configuration
 @dataclass

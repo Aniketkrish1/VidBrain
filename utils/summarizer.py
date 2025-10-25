@@ -12,7 +12,8 @@ import time
 import logging
 from typing import Dict, List, Tuple, Any, Optional
 from dotenv import load_dotenv
-load_dotenv()
+# Force reload environment variables to get latest API key
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -39,6 +40,36 @@ if USE_OPENROUTER:
         timeout=30.0,
         max_retries=2
     )
+
+
+def refresh_openrouter_client():
+    """
+    Refresh the OpenRouter client with the latest API key from environment.
+    Call this if you've updated the .env file and need to reload the API key.
+    """
+    global _client, OPENROUTER_API_KEY, CLASSIFY_MODEL, SUMMARIZE_MODEL, USE_OPENROUTER
+    
+    # Reload environment variables
+    load_dotenv(override=True)
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+    CLASSIFY_MODEL = os.getenv("OPENROUTER_CLASSIFY_MODEL", "qwen/qwen3-vl-32b-instruct")
+    SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "qwen/qwen3-vl-32b-instruct")
+    USE_OPENROUTER = bool(OPENROUTER_API_KEY)
+    
+    if OPENROUTER_API_KEY:
+        _client = OpenAI(
+            base_url=OPENROUTER_BASE, 
+            api_key=OPENROUTER_API_KEY,
+            timeout=30.0,
+            max_retries=2
+        )
+        logger.info(f"OpenRouter client refreshed with new API key (starts with: {OPENROUTER_API_KEY[:15]}...)")
+        return True
+    else:
+        _client = None
+        logger.warning("No OpenRouter API key found after refresh")
+        return False
+
 
 # local summarizer fallback
 _local_summarizer = None

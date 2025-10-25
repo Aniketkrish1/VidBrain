@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 from dotenv import load_dotenv
-load_dotenv()
+# Force reload environment variables to get latest API keys
+load_dotenv(override=True)
 
 # media libs
 import torch
@@ -271,8 +272,13 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
         logger.info(f"Processing topic query: '{query}'")
         update_progress("query_processing", 52, f"Searching for: {query}")
         
-        # Use new topic query processor
-        query_result = process_topic_query(db, query, sentences)
+        # Use enhanced topic query processor with vector search
+        query_result = process_topic_query(
+            query=query,
+            transcript=sentences,
+            srt_content=trans_data.get("srt", ""),
+            db_path=EMBEDDING_DB_PATH
+        )
         
         if not query_result or not query_result.get("segments"):
             logger.warning("No results from topic query; falling back to clustering")
@@ -281,12 +287,22 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
                                              keep_percentile=KEEP_CLUSTER_PERCENTILE)
             summary_text = ""
         else:
-            # Extract data from query result
+            # Extract data from enhanced query result
             summary_text = query_result.get("summary", "")
-            segment_groups = query_result.get("groups", [])
+            confidence = query_result.get("confidence", 0)
+            relevant_segments = query_result.get("segments", [])
             
-            logger.info(f"Topic query successful: {len(segment_groups)} segment groups found")
-            update_progress("query_processing", 58, f"Found {len(segment_groups)} relevant segments")
+            # Convert segments to groups format for clip extraction
+            segment_groups = []
+            for segment in relevant_segments:
+                segment_groups.append([{
+                    "text": segment.get("text", ""),
+                    "start": segment.get("start", 0),
+                    "end": segment.get("end", 0)
+                }])
+            
+            logger.info(f"✅ Enhanced approach: confidence={confidence}%, {len(segment_groups)} groups, {len(relevant_segments)} segments")
+            update_progress("query_processing", 58, f"Found {len(segment_groups)} relevant segments (confidence: {confidence}%)")
             
             # Store summary for later use
             if summaries_callback:
