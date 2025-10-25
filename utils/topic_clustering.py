@@ -43,13 +43,26 @@ def cluster_topics(
     texts = [str(s.get("text", "")).strip() for s in sentences]
     embeddings = encoder.encode(texts, show_progress_bar=False, convert_to_numpy=True)
 
-    # HDBSCAN
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        metric="cosine",
-        cluster_selection_method="eom"
-    )
-    labels = clusterer.fit_predict(embeddings)
+    # HDBSCAN - use precomputed distance matrix for cosine similarity
+    try:
+        # Try with 'cosine' metric (older HDBSCAN versions)
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            metric="cosine",
+            cluster_selection_method="eom"
+        )
+        labels = clusterer.fit_predict(embeddings)
+    except (ValueError, TypeError) as e:
+        # Fallback: use euclidean with normalized embeddings (equivalent to cosine)
+        logger.warning(f"Cosine metric not supported, using euclidean with normalized embeddings: {e}")
+        from sklearn.preprocessing import normalize
+        normalized_embeddings = normalize(embeddings, norm='l2')
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            metric="euclidean",
+            cluster_selection_method="eom"
+        )
+        labels = clusterer.fit_predict(normalized_embeddings)
 
     clusters: Dict[int, List[Dict]] = {}
     for idx, label in enumerate(labels):

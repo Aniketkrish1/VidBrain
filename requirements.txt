@@ -12,6 +12,7 @@ huggingface_hub>=0.23.0
 hdbscan>=0.8.38
 moviepy>=1.0.0
 pyttsx3>=2.90
+edge-tts>=6.1.0
 tiktoken
 numba
 more-itertools
@@ -20,3 +21,5 @@ python-dotenv
 pytubefix>=8.0.0
 yt-dlp
 ffmpeg-python
+openai>=1.0.0
+spacy>=3.0.0

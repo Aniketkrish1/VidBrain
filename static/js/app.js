@@ -1,4 +1,5 @@
 const form = document.getElementById('startForm');
+const uploadForm = document.getElementById('uploadForm');
 const jobBox = document.getElementById('job');
 const statusEl = document.getElementById('status');
 const bar = document.getElementById('bar');
@@ -7,6 +8,41 @@ const progressPercent = document.getElementById('progress-percent');
 const progressStage = document.getElementById('progress-stage');
 const stageDetails = document.getElementById('stage-details');
 const detailsEl = document.getElementById('details');
+const summarySection = document.getElementById('summary-section');
+const summaryText = document.getElementById('summary-text');
+const summaryQuery = document.getElementById('summary-query');
+const summaryContainer = document.getElementById('summary-container');
+
+// Tab switching
+function switchTab(tab) {
+  const youtubeTab = document.getElementById('youtubeTab');
+  const uploadTab = document.getElementById('uploadTab');
+  const youtubeForm = document.getElementById('startForm');
+  const uploadFormEl = document.getElementById('uploadForm');
+  
+  if (tab === 'youtube') {
+    youtubeTab.classList.add('active');
+    youtubeTab.style.color = 'var(--accent)';
+    youtubeTab.style.borderBottom = '2px solid var(--accent)';
+    uploadTab.classList.remove('active');
+    uploadTab.style.color = '#888';
+    uploadTab.style.borderBottom = '2px solid transparent';
+    youtubeForm.classList.remove('hidden');
+    uploadFormEl.classList.add('hidden');
+  } else {
+    uploadTab.classList.add('active');
+    uploadTab.style.color = 'var(--accent)';
+    uploadTab.style.borderBottom = '2px solid var(--accent)';
+    youtubeTab.classList.remove('active');
+    youtubeTab.style.color = '#888';
+    youtubeTab.style.borderBottom = '2px solid transparent';
+    uploadFormEl.classList.remove('hidden');
+    youtubeForm.classList.add('hidden');
+  }
+}
+
+// Make switchTab globally available
+window.switchTab = switchTab;
 
 async function poll(jobId){
   try{
@@ -39,6 +75,25 @@ async function poll(jobId){
     }
     statusEl.textContent = statusText;
 
+    // Display summary when available
+    if(j.summaries && j.summaries.length > 0 && j.summaries[0].summary) {
+      const summary = j.summaries[0];
+      summarySection.classList.remove('hidden');
+      
+      if(summary.query) {
+        summaryQuery.innerHTML = `<strong>Topic:</strong> ${summary.query}`;
+      } else {
+        summaryQuery.innerHTML = '';
+      }
+      
+      summaryText.innerHTML = summary.summary.replace(/\n/g, '<br>');
+      
+      // Add timestamp info if available
+      if(summary.start !== undefined && summary.end !== undefined) {
+        summaryQuery.innerHTML += ` <span style="color: #666;">(${summary.start.toFixed(1)}s - ${summary.end.toFixed(1)}s)</span>`;
+      }
+    }
+
     if(j.status === 'completed' && j.result){
       let summariesHtml = '';
       if(j.summaries && j.summaries.length > 0) {
@@ -49,7 +104,7 @@ async function poll(jobId){
               ${j.summaries.map(s => `
                 <div style="margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #374151;">
                   <div style="font-weight: bold; color: var(--accent); margin-bottom: 5px;">
-                    Topic ${s.cluster_id + 1} (${s.start.toFixed(1)}s - ${s.end.toFixed(1)}s)
+                    ${s.query ? `Topic: ${s.query}` : `Topic ${s.cluster_id + 1}`} (${s.start.toFixed(1)}s - ${s.end.toFixed(1)}s)
                   </div>
                   <div style="color: #e6eef8; line-height: 1.5;">
                     ${s.summary}
@@ -64,8 +119,12 @@ async function poll(jobId){
       resultEl.classList.remove('hidden');
       resultEl.innerHTML = `<div style="text-align: center; padding: 20px;">
                              <h3 style="color: var(--accent); margin-bottom: 15px;">✅ Video Generated Successfully!</h3>
+                             <video controls style="max-width: 100%; border-radius: 8px; margin: 20px 0;">
+                               <source src="/api/download/${jobId}" type="video/mp4">
+                               Your browser does not support the video tag.
+                             </video>
                              <a class="btn" href="/api/download/${jobId}" style="font-size: 16px; padding: 15px 25px;">
-                               📹 Download Summary Video (${(j.result && j.result.includes('summary_output.mp4')) ? 'Ready' : 'Processing...'})
+                               � Download Summary Video
                              </a>
                              <p style="margin-top: 15px; font-size: 0.9em; color: #666;">
                                📁 Saved to: <code style="background: #0e141c; padding: 2px 6px; border-radius: 3px;">${j.result}</code>
@@ -90,94 +149,72 @@ async function poll(jobId){
 form.addEventListener('submit', async (e)=>{
   e.preventDefault();
   const fd = new FormData(form);
-  const simpleMode = document.getElementById('simple_mode').checked;
-  
-  // Validate inputs
-  const youtubeUrl = fd.get('youtube_url');
-  const videoFile = fd.get('video_file');
-  const query = fd.get('query');
-  
-  if (!query || !query.trim()) {
-    alert('Please enter a query (what topic you want to learn about)');
-    return;
-  }
-  
-  if (!youtubeUrl && (!videoFile || videoFile.size === 0)) {
-    alert('Please provide either a YouTube URL or upload a video file');
-    return;
-  }
-  
   jobBox.classList.remove('hidden');
   resultEl.classList.add('hidden');
   stageDetails.classList.add('hidden');
+  summarySection.classList.add('hidden'); // Hide summary initially
 
   // Initialize progress display
   bar.style.width = '0%';
   progressPercent.textContent = '0%';
   progressStage.textContent = 'Initializing';
-  detailsEl.textContent = 'Starting processing...';
+  detailsEl.textContent = 'Starting video processing...';
   statusEl.textContent = 'queued';
 
-  if (simpleMode) {
-    // Simple mode - direct summary
-    try {
-      progressStage.textContent = 'Generating Summary';
-      detailsEl.textContent = 'Processing transcript and generating summary...';
-      bar.style.width = '50%';
-      progressPercent.textContent = '50%';
-      
-      const r = await fetch('/api/simple-summary', {method:'POST', body: fd});
-      const result = await r.json();
-      
-      if (!r.ok || result.error) {
-        statusEl.textContent = `Failed: ${result.error || 'Unknown error'}`;
-        resultEl.classList.remove('hidden');
-        resultEl.innerHTML = `<div style="color:#ef4444; padding: 10px; background: #fee; border-radius: 5px;">
-                               ❌ Processing Failed: ${result.error || 'Unknown error'}
-                             </div>`;
-        return;
-      }
-      
-      // Show success
-      bar.style.width = '100%';
-      progressPercent.textContent = '100%';
-      progressStage.textContent = 'Completed';
-      statusEl.textContent = 'completed';
-      
-      // Display simple summary result
-      resultEl.classList.remove('hidden');
-      resultEl.innerHTML = `
-        <div style="color:#10b981; padding: 15px; background: #f0fff4; border-radius: 8px; margin-top: 20px;">
-          <h4 style="color: var(--accent); margin-bottom: 10px;">📝 Generated Summary:</h4>
-          <div style="background: #0e141c; padding: 15px; border-radius: 8px; color: #e6eef8; line-height: 1.6;">
-            <div style="font-weight: bold; color: var(--accent); margin-bottom: 10px;">
-              Topic: ${result.query}
-            </div>
-            <div>${result.summary}</div>
-            <div style="margin-top: 10px; font-size: 0.9em; color: #9ca3af;">
-              Processed ${result.transcript_length} sentences | Confidence: ${(result.confidence * 100).toFixed(0)}%
-            </div>
-          </div>
-        </div>`;
-        
-    } catch (e) {
-      statusEl.textContent = `Failed: ${e.message}`;
-      resultEl.classList.remove('hidden');
-      resultEl.innerHTML = `<div style="color:#ef4444; padding: 10px; background: #fee; border-radius: 5px;">
-                             ❌ Network Error: ${e.message}
-                           </div>`;
-    }
-  } else {
-    // Full video mode - existing logic
-    const r = await fetch('/api/start', {method:'POST', body: fd});
-    if(!r.ok){
-      const t = await r.json().catch(()=>({error:'Request failed'}));
-      statusEl.textContent = t.error || 'Failed to start';
+  const r = await fetch('/api/start', {method:'POST', body: fd});
+  if(!r.ok){
+    const t = await r.json().catch(()=>({error:'Request failed'}));
+    statusEl.textContent = t.error || 'Failed to start';
+    return;
+  }
+  const {job_id} = await r.json();
+  poll(job_id);
+});
+
+// Upload form handler
+uploadForm.addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const fd = new FormData(uploadForm);
+  
+  // Check file size
+  const fileInput = uploadForm.querySelector('input[type="file"]');
+  const file = fileInput.files[0];
+  
+  if (!file) {
+    statusEl.textContent = 'Please select a video file';
+    return;
+  }
+  
+  // Warn if file is too large
+  const fileSizeMB = file.size / 1024 / 1024;
+  if (fileSizeMB > 500) {
+    if (!confirm(`File size is ${fileSizeMB.toFixed(1)}MB. Large files may take a long time to process. Continue?`)) {
       return;
     }
-    const {job_id} = await r.json();
-    poll(job_id);
   }
+  
+  jobBox.classList.remove('hidden');
+  resultEl.classList.add('hidden');
+  stageDetails.classList.add('hidden');
+  summarySection.classList.add('hidden');
+
+  // Initialize progress display
+  bar.style.width = '0%';
+  progressPercent.textContent = '0%';
+  progressStage.textContent = 'Uploading video...';
+  detailsEl.textContent = `Uploading ${file.name} (${fileSizeMB.toFixed(1)}MB)...`;
+  stageDetails.classList.remove('hidden');
+  statusEl.textContent = 'uploading';
+
+  const r = await fetch('/api/upload', {method:'POST', body: fd});
+  if(!r.ok){
+    const t = await r.json().catch(()=>({error:'Upload failed'}));
+    statusEl.textContent = t.error || 'Upload failed';
+    return;
+  }
+  const {job_id} = await r.json();
+  poll(job_id);
 });
+
 
 

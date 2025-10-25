@@ -21,13 +21,24 @@ logger.setLevel(logging.INFO)
 from openai import OpenAI
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-CLASSIFY_MODEL = os.getenv("OPENROUTER_CLASSIFY_MODEL", "nvidia/nemotron-nano-9b-v2:free")
-SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "nvidia/nemotron-nano-9b-v2:free")
+CLASSIFY_MODEL = os.getenv("OPENROUTER_CLASSIFY_MODEL", "qwen/qwen3-vl-32b-instruct")
+SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "qwen/qwen3-vl-32b-instruct")
 USE_OPENROUTER = bool(OPENROUTER_API_KEY)
+
+# Validate configuration
+if not OPENROUTER_API_KEY:
+    logger.warning("OPENROUTER_API_KEY not found - will use local summarization")
+else:
+    logger.info(f"OpenRouter configured with models - Classify: {CLASSIFY_MODEL}, Summarize: {SUMMARIZE_MODEL}")
 
 _client = None
 if USE_OPENROUTER:
-    _client = OpenAI(base_url=OPENROUTER_BASE, api_key=OPENROUTER_API_KEY)
+    _client = OpenAI(
+        base_url=OPENROUTER_BASE, 
+        api_key=OPENROUTER_API_KEY,
+        timeout=30.0,
+        max_retries=2
+    )
 
 # local summarizer fallback
 _local_summarizer = None
