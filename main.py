@@ -37,10 +37,6 @@ from utils import summarizer as sz
 from utils.database import VectorDB, parse_srt
 from utils import scene_detector as sd
 from utils.assmble_video import assemble_video
-from utils.topic_query_processor import process_topic_query, extract_timestamps_from_groups
-from utils.clip_extractor import prepare_clips_for_topic
-from utils.voiceover_generator import generate_voiceover
-from utils.video_assembler import assemble_topic_video
 
 # ==== CONFIG ====
 TEMP_DIR = os.getenv("TEMP_DIR", "temp_processing")
@@ -265,97 +261,32 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
 
     # 3) Determine clusters (either via query retrieval or automatic clustering)
     update_progress("clustering", 50, "Analyzing topics and clustering...")
-    
-    # NEW: Topic-based query workflow
     if query and query.strip():
-        logger.info(f"Processing topic query: '{query}'")
-        update_progress("query_processing", 52, f"Searching for: {query}")
-        
-        # Use new topic query processor
-        query_result = process_topic_query(db, query, sentences)
-        
-        if not query_result or not query_result.get("segments"):
-            logger.warning("No results from topic query; falling back to clustering")
-            topic_clusters = tc.cluster_topics(sentences, embedding_model=None, 
-                                             min_cluster_size=MIN_CLUSTER_SIZE, 
-                                             keep_percentile=KEEP_CLUSTER_PERCENTILE)
-            summary_text = ""
+        logger.info("User query provided; retrieving relevant transcript segments")
+        hits = retrieve_by_query(db, query, top_k=10)  # Get more hits for better coverage
+        if not hits:
+            logger.warning("No results from vector DB for query; falling back to clustering entire transcript")
+            topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
         else:
-            # Extract data from query result
-            summary_text = query_result.get("summary", "")
-            segment_groups = query_result.get("groups", [])
-            
-            logger.info(f"Topic query successful: {len(segment_groups)} segment groups found")
-            update_progress("query_processing", 58, f"Found {len(segment_groups)} relevant segments")
-            
-            # Store summary for later use
-            if summaries_callback:
-                summaries_callback([{
-                    "cluster_id": 0,
-                    "summary": summary_text,
-                    "start": segment_groups[0][0]["start"] if segment_groups and segment_groups[0] else 0,
-                    "end": segment_groups[-1][-1]["end"] if segment_groups and segment_groups[-1] else 0,
-                    "query": query
-                }])
-            
-            # Prepare clips from relevant segments
-            update_progress("clip_extraction", 60, "Extracting relevant video clips...")
-            
-            clips_data = prepare_clips_for_topic(
-                video_path, 
-                segment_groups, 
-                output_dir=TEMP_DIR,
-                min_clip_duration=2.0
-            )
-            
-            clip_paths = clips_data.get("clips", [])
-            logger.info(f"Extracted {len(clip_paths)} video clips")
-            update_progress("clip_extraction", 70, f"Extracted {len(clip_paths)} clips")
-            
-            if not clip_paths:
-                raise RuntimeError("No video clips could be extracted for the topic")
-            
-            # Generate voiceover from summary
-            update_progress("voiceover", 75, "Generating voiceover from summary...")
-            
-            voiceover_path = os.path.join(TEMP_DIR, "topic_voiceover.mp3")
-            try:
-                generate_voiceover(summary_text, voiceover_path, engine="auto")
-                logger.info(f"Voiceover generated: {voiceover_path}")
-            except Exception as e:
-                logger.error(f"Voiceover generation failed: {e}")
-                raise RuntimeError(f"Failed to generate voiceover: {e}")
-            
-            update_progress("voiceover", 85, "Voiceover generated successfully")
-            
-            # Assemble final video
-            update_progress("assembly", 90, "Assembling final video...")
-            
-            try:
-                final = assemble_topic_video(
-                    clip_paths=clip_paths,
-                    voiceover_path=voiceover_path,
-                    output_path=output_path,
-                    adjust_speed=True
-                )
-                logger.info(f"Final video assembled: {final}")
-            except Exception as e:
-                logger.error(f"Video assembly failed: {e}")
-                raise RuntimeError(f"Failed to assemble video: {e}")
-            
-            update_progress("assembly", 100, f"Topic video created successfully: {query}")
-            
-            # Cleanup
-            cleanup()
-            logger.info("Topic-based pipeline finished successfully")
-            return final
-    
-    # FALLBACK: Original clustering workflow (no query)
+            # For specific queries, create ONE cluster with all relevant segments
+            # Sort hits by start time to maintain temporal order
+            sorted_hits = sorted(hits, key=lambda x: x['start'])
+
+            # Filter out segments that are too short or don't contain relevant keywords
+            query_keywords = set(query.lower().split())
+            filtered_hits = []
+            for hit in sorted_hits:
+                text_lower = hit["text"].lower()
+                # Include segments that contain query keywords or are highly relevant
+                if any(keyword in text_lower for keyword in query_keywords) or len(hit["text"].split()) > 5:
+                    filtered_hits.append(hit)
+
+            # Create a single cluster containing all relevant segments
+            topic_clusters = {0: [{"text": hit["text"], "start": hit["start"], "end": hit["end"]} for hit in filtered_hits]}
+            logger.info(f"Created single cluster with {len(filtered_hits)} segments for query: {query} (filtered from {len(sorted_hits)} total hits)")
     else:
         logger.info("No query: clustering entire transcript")
-        topic_clusters = tc.cluster_topics(sentences, embedding_model=None, 
-                                         min_cluster_size=MIN_CLUSTER_SIZE, 
-                                         keep_percentile=KEEP_CLUSTER_PERCENTILE)
+        topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
 
     if not topic_clusters:
         raise RuntimeError("No topic clusters found after retrieval/clustering")

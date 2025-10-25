@@ -14,7 +14,8 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
 
-load_dotenv()
+# Force reload .env file to override any system environment variables
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -133,54 +134,50 @@ def merge_adjacent_segments(segments: List[Dict], gap_threshold: float = 3.0) ->
 def generate_summary_from_full_transcript(full_transcript: str, query: str, 
                                          relevant_segments: List[Dict] = None) -> Dict:
     """
-    Generate a comprehensive summary from FULL transcript using OpenRouter.
-    Also identifies which parts of the transcript are most relevant.
+    Generate summary using AI to analyze the full transcript for a specific query.
+    This is the CLEAN approach - let AI read everything and extract what's relevant.
     
     Args:
         full_transcript: Complete video transcript text
-        query: Original user query (e.g., "quick sort")
-        relevant_segments: Optional pre-identified relevant segments
+        query: User's query (e.g., "quick sort", "explain recursion")
+        relevant_segments: IGNORED - only kept for compatibility
     
     Returns:
         Dictionary with:
-        - summary: AI-generated summary text
-        - timestamps: List of (start, end) tuples where topic is discussed
-        - confidence: How confident the AI is about the topic presence
+        - summary: AI-generated summary text (in English)
+        - confidence: How confident the AI is about the topic
+        - error: True if API error occurred
+        - rate_limited: True if rate limit hit
     """
     if not full_transcript:
         logger.warning("No transcript to summarize")
-        return {"summary": "", "timestamps": [], "confidence": 0}
+        return {"summary": "No transcript available", "confidence": 0, "error": True}
     
-    logger.info(f"Generating summary for full transcript ({len(full_transcript)} chars) about: {query}")
+    logger.info(f"Generating summary from full transcript ({len(full_transcript)} chars) for query: '{query}'")
     
     # Use OpenRouter if available
     if _client and OPENROUTER_API_KEY:
         try:
-            # Smart prompt that asks AI to both summarize AND identify timestamps
-            prompt = f"""You are analyzing a video transcript to create a focused summary about "{query}".
+            # Clean, direct prompt for crisp summaries
+            prompt = f"""You are a technical content editor. Read the video transcript and create a clean, direct summary about "{query}".
 
-TASK:
+INSTRUCTIONS:
 1. Read the ENTIRE transcript carefully
-2. Identify ALL parts where "{query}" is explained or discussed
-3. Create a clear, comprehensive summary explaining "{query}" based on what's in the video
-4. The summary should be suitable for a voiceover narration (natural spoken language)
+2. Find all information related to "{query}"
+3. Write a DIRECT, factual summary (NO conversational phrases like "Let's dive into" or "The speaker describes")
+4. Start directly with the topic: "{query} is..." or "{query} works by..."
+5. Correct any spelling mistakes or transcription errors in the content
+6. Include key concepts, steps, and technical details
+7. Write in clear, educational language (like a textbook explanation)
+8. If "{query}" is NOT discussed in the video, say: "This topic is not covered in this video."
+9. Length: 4-8 sentences of pure technical content
 
-TRANSCRIPT:
+VIDEO TRANSCRIPT:
 {full_transcript}
 
 ---
 
-Please respond with ONLY the summary text that explains "{query}" based on the video content.
-
-Requirements:
-- Focus ONLY on "{query}" - ignore unrelated content
-- Explain the concept clearly and comprehensively
-- Include key steps, examples, and important details mentioned in the video
-- Use simple, natural language (like you're speaking to someone)
-- Length: 4-8 sentences (60-90 seconds when spoken)
-- If "{query}" is not discussed in the video, say "This topic was not covered in the video."
-
-Summary:"""
+DIRECT SUMMARY (about "{query}"):"""
 
             response = _client.chat.completions.create(
                 model=SUMMARIZE_MODEL,
@@ -199,19 +196,13 @@ Summary:"""
             
             if any(phrase in summary.lower() for phrase in not_found_phrases):
                 logger.warning(f"AI indicates '{query}' not found in transcript")
-                return {"summary": summary, "timestamps": [], "confidence": 0}
+                return {"summary": summary, "confidence": 0}
             
             logger.info(f"Generated AI summary: {len(summary)} chars")
             
-            # Extract timestamps from relevant segments if provided
-            timestamps = []
-            if relevant_segments:
-                timestamps = [(seg["start"], seg["end"]) for seg in relevant_segments]
-            
             return {
                 "summary": summary,
-                "timestamps": timestamps,
-                "confidence": 0.8 if timestamps else 0.5
+                "confidence": 0.8  # High confidence when AI successfully processes
             }
             
         except Exception as e:
@@ -220,79 +211,32 @@ Summary:"""
             
             # Check error type
             is_rate_limit = "429" in error_msg or "rate limit" in error_msg.lower()
-            is_connection_error = "connection" in error_msg.lower() or "timeout" in error_msg.lower()
             
-            # Handle rate limit or connection errors
-            if is_rate_limit or is_connection_error:
-                error_type = "Rate limit" if is_rate_limit else "Connection error"
-                logger.warning(f"{error_type} - using improved fallback summarization")
-                
-                if relevant_segments:
-                    # Filter segments by relevance score (only high-scoring ones)
-                    high_quality_segments = [
-                        seg for seg in relevant_segments 
-                        if seg.get("score", 0) > 0.6  # Only segments with >60% relevance
-                    ]
-                    
-                    if not high_quality_segments:
-                        high_quality_segments = relevant_segments[:5]  # Take top 5 if none above threshold
-                    
-                    logger.info(f"Using {len(high_quality_segments)} high-quality segments for fallback")
-                    
-                    # Build focused summary from high-quality segments only
-                    combined_text = " ".join([seg.get("text", "").strip() for seg in high_quality_segments])
-                    
-                    # Create a more focused summary
-                    query_lower = query.lower()
-                    
-                    # Add context message
-                    summary_parts = [
-                        f"[Note: AI summary limited due to API usage. Showing transcript excerpt about '{query}']",
-                        "",
-                        combined_text[:700] + "..." if len(combined_text) > 700 else combined_text
-                    ]
-                    
-                    summary = "\n".join(summary_parts)
-                    timestamps = [(seg["start"], seg["end"]) for seg in relevant_segments]
-                    
-                    return {
-                        "summary": summary, 
-                        "timestamps": timestamps, 
-                        "confidence": 0.5,
-                        "rate_limited": True
-                    }
-            
-            # Other errors - return error but with timestamps if we have them
-            timestamps = []
-            if relevant_segments:
-                timestamps = [(seg["start"], seg["end"]) for seg in relevant_segments]
+            if is_rate_limit:
+                return {
+                    "summary": f"Rate limit exceeded for OpenRouter API. Please add credits at https://openrouter.ai or wait for reset.", 
+                    "confidence": 0,
+                    "rate_limited": True
+                }
             
             return {
-                "summary": f"API Error: Rate limit exceeded. Please add credits at https://openrouter.ai or wait for reset. Found {len(timestamps)} relevant segments in video.", 
-                "timestamps": timestamps, 
-                "confidence": 0 if not timestamps else 0.3,
+                "summary": f"API Error: {error_msg}", 
+                "confidence": 0,
                 "error": True
             }
     
-    # Fallback: return relevant segments text
-    logger.warning("OpenRouter not available - using fallback")
-    if relevant_segments:
-        combined_text = " ".join([seg.get("text", "").strip() for seg in relevant_segments])
-        max_length = 500
-        summary = combined_text[:max_length] + "..." if len(combined_text) > max_length else combined_text
-        timestamps = [(seg["start"], seg["end"]) for seg in relevant_segments]
-        return {"summary": summary, "timestamps": timestamps, "confidence": 0.3}
-    
-    return {"summary": "Could not generate summary", "timestamps": [], "confidence": 0}
+    # No API available
+    logger.warning("OpenRouter not available")
+    return {"summary": "OpenRouter API not configured. Cannot generate AI summary.", "confidence": 0}
 
 
 def process_topic_query(db, query: str, sentences: List[Dict]) -> Dict:
     """
-    Main function to process a topic query and prepare data for video generation.
-    NOW USES FULL TRANSCRIPT for better AI understanding.
+    SIMPLE approach: Just pass full transcript + query to AI.
+    Let AI do ALL the work - find relevant parts AND generate summary.
     
     Args:
-        db: VectorDB instance
+        db: VectorDB instance (used only for fallback clip extraction)
         query: User query (e.g., "explain quick sort")
         sentences: Full transcript sentences with timestamps
     
@@ -305,32 +249,16 @@ def process_topic_query(db, query: str, sentences: List[Dict]) -> Dict:
     """
     logger.info(f"Processing topic query: '{query}'")
     
-    # 1. Search for relevant segments using vector similarity (sorted by score)
-    relevant_segments = search_topic_in_transcript(db, query, top_k=15)
-    
-    if not relevant_segments:
-        logger.warning(f"Vector search found no relevant segments for: {query}")
-        # Still try with full transcript - AI might find it
-        relevant_segments = []
-    
-    # Keep a copy sorted by relevance for summary generation
-    segments_by_relevance = relevant_segments.copy()
-    
-    # Sort by timestamp for video clip extraction (chronological order)
-    relevant_segments_chronological = sorted(relevant_segments, key=lambda x: x["start"])
-    
-    # 2. Build full transcript text from ALL sentences
+    # 1. Build full transcript text from ALL sentences
     full_transcript = " ".join([sent.get("text", "").strip() for sent in sentences])
-    
     logger.info(f"Full transcript: {len(full_transcript)} chars, {len(sentences)} sentences")
     
-    # 3. Generate summary from FULL TRANSCRIPT (not just segments!)
-    # This gives AI complete context to understand and explain the query
-    # Pass segments sorted by relevance (best matches first)
+    # 2. Let AI analyze EVERYTHING and generate summary
+    logger.info(f"Sending full transcript to AI for analysis...")
     summary_result = generate_summary_from_full_transcript(
         full_transcript, 
         query, 
-        segments_by_relevance  # Use relevance-sorted segments for better fallback
+        relevant_segments=None  # No pre-filtering, let AI decide
     )
     
     summary = summary_result.get("summary", "")
@@ -338,21 +266,43 @@ def process_topic_query(db, query: str, sentences: List[Dict]) -> Dict:
     is_rate_limited = summary_result.get("rate_limited", False)
     is_error = summary_result.get("error", False)
     
-    # Check if it's a rate limit or API error (but we have segments)
-    if is_rate_limited or is_error:
-        if segments_by_relevance:
-            logger.warning(f"API issue, but continuing with {len(segments_by_relevance)} segments found")
-            # Continue processing with segments even if summary is fallback
-        else:
-            logger.error(f"API error and no segments found for: {query}")
-            return {
-                "summary": summary,
-                "segments": [],
-                "groups": [],
-                "query": query
-            }
+    # 3. For video clips: Use vector search as fallback to find approximate timestamps
+    # (We need some way to extract relevant video clips)
+    logger.info(f"Finding relevant segments for video clips...")
+    relevant_segments = search_topic_in_transcript(db, query, top_k=15)
     
-    # Check if topic truly not found (confidence 0 and not an API error)
+    if not relevant_segments:
+        logger.warning(f"No relevant segments found for clips - using first 5 minutes")
+        # Fallback: use first few minutes of video
+        relevant_segments = []
+        for i, sent in enumerate(sentences[:50]):  # First ~5 minutes
+            relevant_segments.append({
+                "text": sent.get("text", ""),
+                "start": sent.get("start", i * 6),
+                "end": sent.get("end", (i + 1) * 6),
+                "score": 0.5
+            })
+    
+    # Sort by timestamp for video clip extraction
+    relevant_segments_chronological = sorted(relevant_segments, key=lambda x: x["start"])
+    
+    # 4. Merge adjacent segments for video clips
+    segment_groups = merge_adjacent_segments(relevant_segments_chronological, gap_threshold=4.0)
+    
+    if not segment_groups:
+        logger.warning("No segment groups - creating single group from all segments")
+        segment_groups = [relevant_segments_chronological] if relevant_segments_chronological else []
+    
+    logger.info(f"Topic query processed: Summary={len(summary)} chars, {len(segment_groups)} clip groups")
+    
+    return {
+        "summary": summary,
+        "segments": relevant_segments_chronological,
+        "groups": segment_groups,
+        "query": query,
+        "confidence": confidence,
+        "ai_generated": True  # Flag that this is AI-generated, not vector-based
+    }
     if confidence == 0 and not is_rate_limited and not is_error:
         if "not covered" in summary.lower():
             logger.error(f"Topic '{query}' not found in video")
