@@ -69,7 +69,8 @@ async def start(
     youtube_url: str = Form(""),
     output_name: str = Form(""),
     query: str = Form(""),
-    whisper_model: str = Form("")
+    whisper_model: str = Form(""),
+    language: str = Form("en")  # Add language parameter with default English
 ):
     """Start a new summarization job from YouTube URL."""
     if not youtube_url:
@@ -84,7 +85,8 @@ async def start(
         "error": None, 
         "result": None, 
         "summaries": [],
-        "query": query  # Store query for reference
+        "query": query,  # Store query for reference
+        "language": language  # Store selected language
     }
 
     async def run_job():
@@ -114,6 +116,7 @@ async def start(
                 whisper_model or None,  # whisper model optional
                 progress_callback,  # progress callback
                 summaries_callback,  # summaries callback
+                language,  # language for translation and TTS
             )
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["progress"] = 100
@@ -133,7 +136,8 @@ async def upload(
     video: UploadFile = File(...),
     query: str = Form(""),
     output_name: str = Form(""),
-    whisper_model: str = Form("")
+    whisper_model: str = Form(""),
+    language: str = Form("en")  # Add language parameter
 ):
     """Start a new summarization job from uploaded video."""
     # Validate file type
@@ -157,7 +161,8 @@ async def upload(
         "error": None, 
         "result": None, 
         "summaries": [],
-        "query": query
+        "query": query,
+        "language": language  # Store selected language
     }
     
     # Save uploaded file
@@ -202,6 +207,7 @@ async def upload(
                 whisper_model or None,
                 progress_callback,
                 summaries_callback,
+                language,  # language for translation and TTS
             )
             
             jobs[job_id]["status"] = "completed"

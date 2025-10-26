@@ -88,6 +88,32 @@ async function poll(jobId){
       
       summaryText.innerHTML = summary.summary.replace(/\n/g, '<br>');
       
+      // Add language info for multilingual summaries
+      if(summary.display_language && summary.display_language !== 'en') {
+        const languageNames = {
+          'hi': 'Hindi (हिंदी)',
+          'bn': 'Bengali (বাংলা)', 
+          'ta': 'Tamil (தமிழ்)',
+          'te': 'Telugu (తెలుగు)',
+          'ml': 'Malayalam (മലയാളം)',
+          'kn': 'Kannada (ಕನ್ನಡ)',
+          'gu': 'Gujarati (ગુજરાતી)',
+          'mr': 'Marathi (मराठी)',
+          'pa': 'Punjabi (ਪੰਜਾਬੀ)',
+          'or': 'Odia (ଓଡ଼ିଆ)',
+          'as': 'Assamese (অসমীয়া)'
+        };
+        
+        const langName = languageNames[summary.display_language] || summary.display_language;
+        let languageInfo = `<span style="color: var(--accent); font-size: 0.85em;">📝 Summary in ${langName}</span>`;
+        
+        if(summary.voiceover_language === 'en' && summary.display_language !== 'en') {
+          languageInfo += ` <span style="color: #ffa500; font-size: 0.8em;">🎤 Voiceover in English</span>`;
+        }
+        
+        summaryQuery.innerHTML += ` ${languageInfo}`;
+      }
+      
       // Add timestamp info if available
       if(summary.start !== undefined && summary.end !== undefined) {
         summaryQuery.innerHTML += ` <span style="color: #666;">(${summary.start.toFixed(1)}s - ${summary.end.toFixed(1)}s)</span>`;

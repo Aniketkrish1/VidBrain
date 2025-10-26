@@ -42,6 +42,7 @@ from utils.topic_query_processor import process_topic_query, extract_timestamps_
 from utils.clip_extractor import prepare_clips_for_topic
 from utils.voiceover_generator import generate_voiceover
 from utils.video_assembler import assemble_topic_video
+from utils.sarvam_ai import SarvamAI, translate_summary, generate_multilingual_voiceover
 
 # ==== CONFIG ====
 TEMP_DIR = os.getenv("TEMP_DIR", "temp_processing")
@@ -209,7 +210,7 @@ def generate_voiceovers_from_summaries(summaries: Dict[int, Dict], tts_model: st
     return out
 
 # ==== pipeline entry point ====
-def process_video(video_path: Optional[str], youtube_url: Optional[str], query: Optional[str], output_path: str, whisper_model: Optional[str] = None, progress_callback: Optional[callable] = None, summaries_callback: Optional[callable] = None):
+def process_video(video_path: Optional[str], youtube_url: Optional[str], query: Optional[str], output_path: str, whisper_model: Optional[str] = None, progress_callback: Optional[callable] = None, summaries_callback: Optional[callable] = None, language: str = "en"):
     """
     If youtube_url provided -> download video -> set video_path accordingly.
     If video_path provided -> use it.
@@ -334,16 +335,6 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             logger.info(f"✅ Enhanced approach: confidence={confidence}%, {len(segment_groups)} groups, {len(relevant_segments)} segments")
             update_progress("query_processing", 58, f"Found {len(segment_groups)} relevant segments (confidence: {confidence}%)")
             
-            # Store summary for later use
-            if summaries_callback:
-                summaries_callback([{
-                    "cluster_id": 0,
-                    "summary": summary_text,
-                    "start": segment_groups[0][0]["start"] if segment_groups and segment_groups[0] else 0,
-                    "end": segment_groups[-1][-1]["end"] if segment_groups and segment_groups[-1] else 0,
-                    "query": query
-                }])
-            
             # Prepare clips from relevant segments
             update_progress("clip_extraction", 60, "Extracting relevant video clips...")
             
@@ -373,18 +364,55 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             if not clip_paths:
                 raise RuntimeError("No video clips could be extracted for the topic")
             
-            # Generate voiceover from summary
+            # Generate voiceover from summary with multilingual support
             update_progress("voiceover", 75, "Generating voiceover from summary...")
             
-            voiceover_path = os.path.join(TEMP_DIR, "topic_voiceover.mp3")
-            try:
-                generate_voiceover(summary_text, voiceover_path, engine="auto")
-                logger.info(f"Voiceover generated: {voiceover_path}")
-            except Exception as e:
-                logger.error(f"Voiceover generation failed: {e}")
-                raise RuntimeError(f"Failed to generate voiceover: {e}")
+            voiceover_path = os.path.join(TEMP_DIR, "topic_voiceover.wav")
             
+            # Check if translation and multilingual TTS is needed
+            if language != "en":
+                try:
+                    logger.info(f"🌐 Generating multilingual voiceover for language: {language}")
+                    update_progress("translation", 77, f"Translating summary to {language}...")
+                    
+                    # Use Sarvam AI for translation and TTS
+                    translated_text, voiceover_path = generate_multilingual_voiceover(
+                        summary_text, 
+                        language, 
+                        voiceover_path, 
+                        source_language="en"
+                    )
+                    
+                    logger.info(f"✅ Multilingual voiceover generated successfully")
+                    logger.info(f"📝 Translated summary: {translated_text[:100]}...")
+                    
+                    # Update summary for display
+                    summary_text = translated_text
+                    
+                except Exception as e:
+                    logger.error(f"Sarvam AI processing failed: {e}")
+                    logger.info("Falling back to English TTS...")
+                    voiceover_path = os.path.join(TEMP_DIR, "topic_voiceover.mp3")
+                    generate_voiceover(summary_text, voiceover_path, engine="auto")
+            else:
+                # Use local TTS for English
+                logger.info("🔊 Generating English voiceover...")
+                voiceover_path = os.path.join(TEMP_DIR, "topic_voiceover.mp3")
+                generate_voiceover(summary_text, voiceover_path, engine="auto")
+            
+            logger.info(f"Voiceover generated: {voiceover_path}")
             update_progress("voiceover", 85, "Voiceover generated successfully")
+            
+            # Store translated summary for frontend display (after translation is complete)
+            if summaries_callback:
+                summaries_callback([{
+                    "cluster_id": 0,
+                    "summary": summary_text,  # This now contains the translated text if language != "en"
+                    "start": segment_groups[0][0]["start"] if segment_groups and segment_groups[0] else 0,
+                    "end": segment_groups[-1][-1]["end"] if segment_groups and segment_groups[-1] else 0,
+                    "query": query,
+                    "language": language  # Add language info for frontend
+                }])
             
             # Assemble final video
             update_progress("assembly", 90, "Assembling final video...")
@@ -458,9 +486,99 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             })
         summaries_callback(summary_list)
 
-    # 6) TTS generation
+    # 6) TTS generation with multilingual support
     update_progress("tts", 80, "Generating voiceovers...")
-    voiceover_paths = generate_voiceovers_from_summaries(summaries, tts_model=TTS_MODEL)
+    
+    if language != "en":
+        # Use Sarvam AI for multilingual TTS
+        logger.info(f"🌐 Using multilingual TTS for language: {language}")
+        voiceover_paths = {}
+        sarvam = SarvamAI()
+        
+        for cid, data in summaries.items():
+            summary_text = data.get("summary", "")
+            if not summary_text:
+                logger.warning("Empty summary for cluster %s, skipping TTS", cid)
+                continue
+            
+            try:
+                update_progress("tts", 80 + (cid * 10 // len(summaries)), f"Generating {language} voiceover for topic {cid + 1}...")
+                
+                logger.info(f"🎯 Processing cluster {cid} with text: {summary_text[:50]}...")
+                
+                # Step 1: Always translate the text first (for frontend display)
+                logger.info(f"🌐 Translating text to {language} for frontend display...")
+                try:
+                    translated_text = sarvam.translate_text(summary_text, language, "en")
+                    logger.info(f"✅ Translation successful: {translated_text[:50]}...")
+                    
+                    # Update summary with translated text for frontend display
+                    summaries[cid]["summary"] = translated_text
+                    summaries[cid]["display_language"] = language
+                    logger.info(f"📝 Summary updated with translated text for cluster {cid}")
+                    
+                except Exception as translate_e:
+                    logger.warning(f"⚠️ Translation failed for cluster {cid}: {translate_e}")
+                    logger.info(f"📝 Using original English text for display")
+                    translated_text = summary_text
+                    summaries[cid]["summary"] = summary_text
+                    summaries[cid]["display_language"] = "en"
+                
+                # Step 2: Try to generate TTS in target language
+                try:
+                    logger.info(f"🎤 Generating {language} TTS...")
+                    audio_data = sarvam.generate_speech(translated_text, language)
+                    
+                    # Save audio file
+                    audio_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.wav")
+                    sarvam.save_audio(audio_data, audio_path)
+                    voiceover_paths[cid] = audio_path
+                    
+                    logger.info(f"✅ {language} TTS successful: {len(audio_data)} bytes")
+                    logger.info(f"✅ Multilingual voiceover generated for cluster {cid}")
+                    
+                except Exception as tts_e:
+                    logger.warning(f"⚠️ {language} TTS failed for cluster {cid}: {tts_e}")
+                    logger.info(f"🔄 Generating English TTS for voiceover (keeping {language} text for display)")
+                    
+                    # Use English TTS but keep translated text for display
+                    file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.mp3")
+                    try:
+                        engine = pyttsx3.init()
+                        engine.save_to_file(summary_text, file_path)  # Use original English for TTS
+                        engine.runAndWait()
+                        engine.stop()
+                        if os.path.exists(file_path):
+                            voiceover_paths[cid] = file_path
+                            summaries[cid]["voiceover_language"] = "en"  # Mark voiceover as English
+                            logger.info(f"✅ English TTS completed for cluster {cid}")
+                            logger.info(f"📋 Result: {language} text display + English voiceover")
+                    except Exception as fallback_e:
+                        logger.error(f"❌ Fallback TTS also failed for cluster {cid}: {fallback_e}")
+                
+            except Exception as e:
+                logger.error(f"❌ Processing failed for cluster {cid}: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                
+                # Log full traceback for debugging
+                import traceback
+                logger.error("Full traceback:")
+                logger.error(traceback.format_exc())
+                
+                # Final fallback: English text + English TTS
+                logger.info(f"🔄 Final fallback: English text + English TTS for cluster {cid}")
+                summaries[cid]["summary"] = summary_text
+                summaries[cid]["display_language"] = "en"
+                summaries[cid]["voiceover_language"] = "en"
+        
+        # Log final summary state for debugging
+        logger.info(f"📋 Final summaries state:")
+        for cid, data in summaries.items():
+            summary_preview = data.get("summary", "")[:50]
+            logger.info(f"   Cluster {cid}: {summary_preview}...")
+    else:
+        # Use local TTS for English
+        voiceover_paths = generate_voiceovers_from_summaries(summaries, tts_model=TTS_MODEL)
 
     # sanity check
     missing = [cid for cid in summaries.keys() if cid not in voiceover_paths]
