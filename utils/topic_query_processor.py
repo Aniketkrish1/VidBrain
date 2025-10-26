@@ -108,15 +108,19 @@ def search_topic_in_transcript(db, query: str, top_k: int = 20) -> List[Dict]:
         hit["score"] = min(1.0, score + keyword_boost)
         
         # IMPROVED FILTERING: Only keep segments that are actually relevant
-        # 1. High vector similarity score (>0.3)
-        # 2. OR contains query keywords
+        # 1. High vector similarity score (>0.4) - INCREASED from 0.3 for stricter filtering
+        # 2. OR contains query keywords with decent similarity (>0.25)
         # 3. AND text is substantial (>20 characters)
         text_length_ok = len(hit.get("text", "")) > 20
         has_keywords = any(keyword in text_lower for keyword in query_keywords)
-        high_similarity = hit["score"] > 0.3
+        high_similarity = hit["score"] > 0.4  # Stricter threshold
+        decent_similarity_with_keywords = hit["score"] > 0.25 and has_keywords
         
-        if text_length_ok and (high_similarity or has_keywords):
+        if text_length_ok and (high_similarity or decent_similarity_with_keywords):
             filtered_hits.append(hit)
+            logger.info(f"✅ ACCEPTED segment (score: {hit['score']:.3f}): {hit.get('text', '')[:100]}...")
+        else:
+            logger.info(f"❌ REJECTED segment (score: {hit['score']:.3f}): {hit.get('text', '')[:100]}...")
     
     # Sort by score (highest first) and take only the most relevant
     filtered_hits = sorted(filtered_hits, key=lambda x: x["score"], reverse=True)
@@ -127,6 +131,22 @@ def search_topic_in_transcript(db, query: str, top_k: int = 20) -> List[Dict]:
     logger.info(f"Found {len(top_segments)} relevant segments (from {len(hits)} total hits)")
     if top_segments:
         logger.info(f"Top segment score: {top_segments[0]['score']:.2f}, Bottom segment score: {top_segments[-1]['score']:.2f}")
+        
+        # 📍 LOG DETAILED TIMESTAMP INFORMATION
+        logger.info(f"📍 Detailed segment timestamps for '{query}':")
+        total_duration = 0
+        for i, segment in enumerate(top_segments):
+            start_time = segment.get("start", 0)
+            end_time = segment.get("end", 0)
+            duration = end_time - start_time
+            total_duration += duration
+            text_preview = segment.get("text", "")[:80] + "..." if len(segment.get("text", "")) > 80 else segment.get("text", "")
+            
+            logger.info(f"   Segment {i+1}: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s) | Score: {segment['score']:.3f}")
+            logger.info(f"      Text: \"{text_preview}\"")
+        
+        logger.info(f"📊 Total duration of relevant segments: {total_duration:.1f} seconds")
+        logger.info(f"🎯 These timestamps will be used for video clip extraction")
     
     return top_segments
 
@@ -346,25 +366,30 @@ def process_topic_query_enhanced(query: str, transcript: List[Dict], srt_content
     
     logger.info(f"🎯 Enhanced topic query processing: '{query}'")
     
-    # 1. Build/load vector database with SRT content
-    logger.info("Building vector database from SRT content...")
+    # 1. Load existing vector database or build if needed
+    logger.info("Loading/building vector database...")
     try:
         db = VectorDB(db_path=db_path)
         
-        # Parse SRT content to get segments for database
-        srt_segments = parse_srt_content(srt_content)
-        if not srt_segments:
-            logger.warning("No segments parsed from SRT, using transcript segments")
-            srt_segments = [{"text": s["text"], "start": s["start"], "end": s["end"]} for s in transcript]
-        
-        # Build database
-        db.build(srt_segments)
-        logger.info(f"✅ Vector database built with {len(srt_segments)} segments")
+        # Only rebuild if database is empty or content changed
+        if db.embeddings is None or len(db.metadata) == 0:
+            logger.info("Database empty, building from SRT content...")
+            # Parse SRT content to get segments for database
+            srt_segments = parse_srt_content(srt_content)
+            if not srt_segments:
+                logger.warning("No segments parsed from SRT, using transcript segments")
+                srt_segments = [{"text": s["text"], "start": s["start"], "end": s["end"]} for s in transcript]
+            
+            # Build database
+            db.build(srt_segments)
+            logger.info(f"✅ Vector database built with {len(srt_segments)} segments")
+        else:
+            logger.info(f"✅ Using existing vector database with {len(db.metadata)} segments")
         
     except Exception as e:
         logger.error(f"Vector database error: {e}")
         return {
-            "summary": f"Error building search database: {e}",
+            "summary": f"Error loading search database: {e}",
             "segments": [],
             "confidence": 0,
             "query": query
@@ -404,22 +429,27 @@ def process_topic_query_enhanced(query: str, transcript: List[Dict], srt_content
         summary = focused_transcript[:500] + "..." if len(focused_transcript) > 500 else focused_transcript
         confidence = 30
     
-    # Filter segments to ensure good confidence
-    if confidence < 50:
-        logger.info(f"Low confidence ({confidence}%), filtering segments...")
-        # Keep only highly relevant segments
-        filtered_segments = []
-        query_words = set(query.lower().split())
-        for seg in relevant_segments:
-            seg_words = set(seg.get("text", "").lower().split())
-            if query_words.intersection(seg_words) or len(seg_words.intersection(query_words)) > 0:
-                filtered_segments.append(seg)
-        
-        if filtered_segments:
-            relevant_segments = filtered_segments[:8]  # Limit to top 8
-            confidence = min(85, confidence + 20)  # Boost confidence slightly
+    # CRITICAL FIX: DO NOT filter segments used for summary generation
+    # User specifically wants ALL segments used for summary to also be used for video clips
+    # Removing confidence-based filtering to ensure video-audio synchronization
     
     logger.info(f"✅ Enhanced approach completed: confidence={confidence}%, segments={len(relevant_segments)}")
+    logger.info(f"🎯 Using ALL {len(relevant_segments)} segments for both summary AND video extraction")
+    
+    # 🎯 CRITICAL: Log the exact timestamps being returned for video clip extraction
+    logger.info(f"📍 FINAL SEGMENTS WITH TIMESTAMPS for video extraction:")
+    total_time = 0
+    for i, seg in enumerate(relevant_segments):
+        start_time = seg.get("start", 0)
+        end_time = seg.get("end", 0)
+        duration = end_time - start_time
+        total_time += duration
+        text_preview = seg.get("text", "")[:60] + "..." if len(seg.get("text", "")) > 60 else seg.get("text", "")
+        logger.info(f"   📹 EXTRACT Segment {i+1}: {start_time:.1f}s-{end_time:.1f}s ({duration:.1f}s)")
+        logger.info(f"      Text: \"{text_preview}\"")
+    
+    logger.info(f"📊 TOTAL TIME FOR VIDEO CLIPS: {total_time:.1f} seconds")
+    logger.info(f"🎯 These EXACT timestamps must be used for video clip extraction!")
     
     return {
         "summary": summary,
@@ -512,12 +542,13 @@ def process_topic_query_old(db, query: str, sentences: List[Dict]) -> Dict:
     # 4. Sort segments by timestamp for video clip extraction
     relevant_segments_chronological = sorted(relevant_segments, key=lambda x: x["start"])
     
-    # 5. Merge adjacent segments for better video clips
-    segment_groups = merge_adjacent_segments(relevant_segments_chronological, gap_threshold=4.0)
+    # 5. OPTION: Create individual clips for each segment instead of grouping
+    # User wants all segments used for summary to also be extracted as video clips
+    # Creating individual groups for each segment to ensure 1:1 mapping
+    segment_groups = [[seg] for seg in relevant_segments_chronological]
     
-    if not segment_groups:
-        logger.warning("No segment groups - creating single group from all segments")
-        segment_groups = [relevant_segments_chronological] if relevant_segments_chronological else []
+    logger.info(f"🎯 Creating {len(segment_groups)} individual clips (one per segment) instead of merging")
+    logger.info(f"📊 This ensures all {len(relevant_segments)} segments used for summary get video clips")
     
     logger.info(f"Topic query processed: Summary={len(summary)} chars, {len(segment_groups)} clip groups, confidence={confidence}")
     

@@ -34,3 +34,4 @@ if os.path.exists(outputs_dir):
     print(f'📁 Outputs directory contains {len(os.listdir(outputs_dir))} files')
 else:
     print('❌ Outputs directory missing')
+

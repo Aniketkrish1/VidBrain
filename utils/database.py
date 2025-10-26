@@ -60,9 +60,11 @@ def parse_srt_content(content):
 # 2. Embed with Torch (GPU if available)
 # ------------------------------
 class VectorDB:
-    def __init__(self, model_name="multi-qa-mpnet-base-dot-v1", db_path="vector_db.pkl"):
+    def __init__(self, model_name="multi-qa-mpnet-base-dot-v1", db_path="vector_db.pkl", clear_on_startup=False):
         """
         --- IMPROVEMENT: Changed default model to one better for search/Q&A ---
+        Args:
+            clear_on_startup: If True, deletes existing database file on initialization
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = SentenceTransformer(model_name, device=self.device)
@@ -71,12 +73,33 @@ class VectorDB:
         self.embeddings = None  # torch.Tensor
         self.metadata = []      # list of dicts
 
+        # Clear cache on startup if requested
+        if clear_on_startup and os.path.exists(db_path):
+            os.remove(db_path)
+            print(f"🗑️  Cleared vector database cache: {db_path}")
+
         if os.path.exists(db_path):
             self.load()
         print(f"VectorDB using device: {self.device}")
         
     def build(self, segments):
+        """
+        Build vector database from segments.
+        Avoids rebuilding if content hasn't changed.
+        """
+        import hashlib
+        
+        # Create content hash to check if segments have changed
         texts = [seg["text"] for seg in segments]
+        content_str = "|".join(texts)
+        content_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
+        
+        # Check if we have existing database with same content
+        if self.embeddings is not None and hasattr(self, '_content_hash'):
+            if self._content_hash == content_hash:
+                print(f"Database content unchanged - using existing {len(segments)} embeddings.")
+                return
+        
         print(f"Building embeddings for {len(texts)} segments...")
         embeddings = self.model.encode(
             texts, 
@@ -90,12 +113,17 @@ class VectorDB:
         # We can just assign them directly.
         self.embeddings = embeddings
         self.metadata = segments
+        self._content_hash = content_hash  # Store hash for future comparisons
         self.save()
         print("Database built and saved.")
 
     def save(self):
         with open(self.db_path, "wb") as f:
-            data = {"embeddings": None, "metadata": self.metadata}
+            data = {
+                "embeddings": None, 
+                "metadata": self.metadata,
+                "content_hash": getattr(self, '_content_hash', None)
+            }
             if self.embeddings is not None:
                 try:
                     # Move to CPU for pickling, as it's safer
@@ -112,6 +140,7 @@ class VectorDB:
                 if data["embeddings"] is not None:
                     self.embeddings = data["embeddings"].to(self.device)
                     self.metadata = data["metadata"]
+                    self._content_hash = data.get("content_hash", None)  # Load hash if available
                     print(f"Loaded existing database with {len(self.metadata)} entries.")
                 else:
                     print("Loaded database, but no embeddings found.")

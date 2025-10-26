@@ -124,7 +124,7 @@ def assemble_topic_video(clip_paths: List[str],
                         output_path: str,
                         adjust_speed: bool = True) -> str:
     """
-    Assemble final video from clips and voiceover.
+    Assemble final video from clips and voiceover with improved synchronization.
     
     Args:
         clip_paths: List of video clip file paths
@@ -135,7 +135,8 @@ def assemble_topic_video(clip_paths: List[str],
     Returns:
         Path to final video file
     """
-    logger.info(f"Assembling video from {len(clip_paths)} clips with voiceover")
+    logger.info(f"🎬 Assembling synchronized video from {len(clip_paths)} clips with voiceover")
+    logger.info(f"🔍 VERIFICATION: Ensuring clips match the topic-focused voiceover")
     
     if not clip_paths:
         raise ValueError("No video clips provided")
@@ -143,18 +144,38 @@ def assemble_topic_video(clip_paths: List[str],
     if not os.path.exists(voiceover_path):
         raise FileNotFoundError(f"Voiceover not found: {voiceover_path}")
     
+    # Verify clip files exist
+    valid_clips = []
+    for i, clip_path in enumerate(clip_paths):
+        if os.path.exists(clip_path):
+            valid_clips.append(clip_path)
+            logger.info(f"✅ Clip {i+1} exists: {Path(clip_path).name}")
+        else:
+            logger.error(f"❌ Missing clip {i+1}: {clip_path}")
+    
+    if not valid_clips:
+        raise RuntimeError("No valid video clips found for assembly")
+    
+    if len(valid_clips) != len(clip_paths):
+        logger.warning(f"⚠️  Using {len(valid_clips)} valid clips out of {len(clip_paths)} requested")
+    
     # Get voiceover duration
     voiceover_duration = get_audio_duration(voiceover_path)
-    logger.info(f"Voiceover duration: {voiceover_duration:.2f}s")
+    logger.info(f"🎵 Voiceover duration: {voiceover_duration:.2f}s")
+    logger.info(f"🎯 Voiceover contains topic-focused summary that should match video clips")
     
     try:
         # Load video clips
         video_clips = []
+        clip_durations = []
+        
         for clip_path in clip_paths:
             if os.path.exists(clip_path):
                 try:
                     clip = VideoFileClip(clip_path)
                     video_clips.append(clip)
+                    clip_durations.append(clip.duration)
+                    logger.info(f"📹 Loaded clip: {Path(clip_path).name} ({clip.duration:.2f}s)")
                 except Exception as e:
                     logger.error(f"Failed to load clip {clip_path}: {e}")
                     continue
@@ -165,8 +186,13 @@ def assemble_topic_video(clip_paths: List[str],
             raise RuntimeError("No valid video clips loaded")
         
         # Calculate total video duration
-        total_video_duration = sum(clip.duration for clip in video_clips)
-        logger.info(f"Total video duration: {total_video_duration:.2f}s")
+        total_video_duration = sum(clip_durations)
+        logger.info(f"📊 Total video duration: {total_video_duration:.2f}s")
+        logger.info(f"🎯 Target audio duration: {voiceover_duration:.2f}s")
+        
+        # Calculate synchronization ratio
+        sync_ratio = voiceover_duration / total_video_duration if total_video_duration > 0 else 1.0
+        logger.info(f"⚡ Sync ratio: {sync_ratio:.3f} (1.0 = perfect match)")
         
         # Concatenate video clips
         if len(video_clips) > 1:
@@ -175,43 +201,61 @@ def assemble_topic_video(clip_paths: List[str],
             concatenated_video = video_clips[0]
         
         # Adjust video speed to match audio duration if needed
-        if adjust_speed and abs(concatenated_video.duration - voiceover_duration) > 2.0:
+        duration_diff = abs(concatenated_video.duration - voiceover_duration)
+        
+        if adjust_speed and duration_diff > 1.0:  # Only adjust if difference > 1 second
+            logger.info(f"🔧 Adjusting video speed for better sync (diff: {duration_diff:.2f}s)")
             concatenated_video = adjust_video_speed_to_audio(
                 concatenated_video, 
                 voiceover_duration,
                 max_speedup=1.3
             )
+            logger.info(f"✅ Video speed adjusted to {concatenated_video.duration:.2f}s")
+        else:
+            logger.info(f"✅ Video duration acceptable, no speed adjustment needed")
         
         # Load voiceover audio
         voiceover_audio = AudioFileClip(voiceover_path)
         
-        # Handle duration mismatch
-        final_duration = max(concatenated_video.duration, voiceover_audio.duration)
+        # Precise synchronization handling
+        video_duration = concatenated_video.duration
+        audio_duration = voiceover_audio.duration
         
-        # Extend video if audio is longer
-        if voiceover_audio.duration > concatenated_video.duration + 0.5:
-            logger.info("Audio longer than video, extending video")
-            extra_duration = voiceover_audio.duration - concatenated_video.duration
+        logger.info(f"🎬 Final synchronization:")
+        logger.info(f"   Video: {video_duration:.2f}s")
+        logger.info(f"   Audio: {audio_duration:.2f}s")
+        logger.info(f"   Difference: {abs(video_duration - audio_duration):.2f}s")
+        
+        # Handle duration mismatch with better logic
+        if audio_duration > video_duration + 0.3:  # Audio significantly longer
+            logger.info("🎵 Audio longer than video, extending video with last frame")
+            extra_duration = audio_duration - video_duration
             
-            # Loop the last clip or create black screen
-            if video_clips:
-                # Use last frame extended
-                last_frame = concatenated_video.to_ImageClip(t=concatenated_video.duration - 0.1)
-                last_frame = last_frame.with_duration(extra_duration)
-                concatenated_video = concatenate_videoclips([concatenated_video, last_frame])
-            else:
-                padding = create_silent_clip(extra_duration, concatenated_video.size)
-                concatenated_video = concatenate_videoclips([concatenated_video, padding])
+            # Create static last frame for remaining audio
+            last_frame = concatenated_video.to_ImageClip(t=video_duration - 0.1)
+            last_frame = last_frame.with_duration(extra_duration)
+            concatenated_video = concatenate_videoclips([concatenated_video, last_frame])
+            
+        elif video_duration > audio_duration + 0.3:  # Video significantly longer
+            logger.info("🎬 Video longer than audio, trimming video to match")
+            concatenated_video = concatenated_video.subclipped(0, audio_duration)
         
-        # Trim audio if longer than video
-        if voiceover_audio.duration > concatenated_video.duration:
-            voiceover_audio = voiceover_audio.subclipped(0, concatenated_video.duration)
+        # Final duration match
+        final_duration = min(concatenated_video.duration, voiceover_audio.duration)
         
-        # Set audio to video
+        # Trim both to exact same duration for perfect sync
+        if concatenated_video.duration > final_duration:
+            concatenated_video = concatenated_video.subclipped(0, final_duration)
+        if voiceover_audio.duration > final_duration:
+            voiceover_audio = voiceover_audio.subclipped(0, final_duration)
+        
+        # Set audio to video with perfect synchronization
         final_video = concatenated_video.with_audio(voiceover_audio)
         
-        # Write output
-        logger.info(f"Writing final video to: {output_path}")
+        logger.info(f"🎯 Perfect sync achieved: {final_video.duration:.2f}s video + audio")
+        
+        # Write output with optimized settings
+        logger.info(f"💾 Writing final synchronized video to: {output_path}")
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         
         final_video.write_videofile(
@@ -231,7 +275,7 @@ def assemble_topic_video(clip_paths: List[str],
         for clip in video_clips:
             clip.close()
         
-        logger.info(f"Successfully assembled video: {output_path}")
+        logger.info(f"✅ Synchronized video assembly completed: {output_path}")
         return output_path
         
     except Exception as e:

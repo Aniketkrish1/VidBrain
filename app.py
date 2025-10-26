@@ -14,6 +14,35 @@ from main import process_video, OUTPUT_VIDEO_NAME
 
 logger = logging.getLogger(__name__)
 
+# Startup cleanup - clear vector database cache if enabled
+CLEAR_VECTOR_CACHE = os.getenv("CLEAR_VECTOR_CACHE", "true").lower() == "true"
+if CLEAR_VECTOR_CACHE:
+    vector_db_path = os.getenv("VECTOR_DB_PATH", "vector_db.pkl")
+    if os.path.exists(vector_db_path):
+        os.remove(vector_db_path)
+        logger.info(f"🗑️  Cleared vector database cache on startup: {vector_db_path}")
+
+# Clear video processing cache on startup
+temp_dir = os.getenv("TEMP_DIR", "temp_processing")
+if os.path.exists(temp_dir):
+    import shutil
+    try:
+        shutil.rmtree(temp_dir)
+        logger.info(f"🗑️  Cleared video processing cache: {temp_dir}")
+    except Exception as e:
+        logger.warning(f"Could not clear temp directory: {e}")
+
+# Clear old output files
+output_dir = "outputs"
+if os.path.exists(output_dir):
+    for file in os.listdir(output_dir):
+        if file.endswith(('.mp4', '.mp3', '.wav')):
+            try:
+                os.remove(os.path.join(output_dir, file))
+                logger.info(f"🗑️  Cleared old output: {file}")
+            except Exception as e:
+                logger.warning(f"Could not remove {file}: {e}")
+
 app = FastAPI()
 
 # Serve static assets for CSS and JS

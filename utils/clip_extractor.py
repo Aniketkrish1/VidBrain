@@ -43,31 +43,31 @@ def convert_timestamp_to_seconds(timestamp) -> float:
     return 0.0
 
 
-def expand_clip_duration(start: float, end: float, min_duration: float = 2.0, 
+def expand_clip_duration(start: float, end: float, min_duration: float = 1.0, 
                         max_duration: float = 30.0, video_duration: float = None) -> Tuple[float, float]:
     """
-    Ensure clip has reasonable duration and add padding.
+    Ensure clip has reasonable duration with MINIMAL padding to avoid irrelevant content.
     
     Args:
         start: Start time in seconds
         end: End time in seconds
-        min_duration: Minimum clip duration
+        min_duration: Minimum clip duration (reduced to 1.0 second)
         max_duration: Maximum clip duration
         video_duration: Total video duration for boundary checking
     
     Returns:
-        Adjusted (start, end) tuple
+        Adjusted (start, end) tuple with minimal expansion
     """
     duration = end - start
     
-    # If clip is too short, expand it
+    # Only expand if clip is extremely short (less than 1 second)
     if duration < min_duration:
         expansion = (min_duration - duration) / 2
         start = max(0, start - expansion)
         end = end + expansion
     
-    # Add small padding for context
-    padding = 0.5
+    # MINIMAL padding only for smooth cuts - reduced from 0.5 to 0.1 seconds
+    padding = 0.1
     start = max(0, start - padding)
     end = end + padding
     
@@ -84,13 +84,14 @@ def expand_clip_duration(start: float, end: float, min_duration: float = 2.0,
 
 
 def merge_overlapping_clips(clips: List[Tuple[float, float]], 
-                           gap_threshold: float = 2.0) -> List[Tuple[float, float]]:
+                           gap_threshold: float = 1.0) -> List[Tuple[float, float]]:
     """
     Merge clips that are close together or overlapping.
+    REDUCED gap_threshold to avoid merging unrelated topic segments.
     
     Args:
         clips: List of (start, end) tuples
-        gap_threshold: Maximum gap in seconds to merge clips
+        gap_threshold: Maximum gap in seconds to merge clips (reduced to 1.0)
     
     Returns:
         List of merged (start, end) tuples
@@ -107,14 +108,17 @@ def merge_overlapping_clips(clips: List[Tuple[float, float]],
         prev_start, prev_end = merged[-1]
         
         # Check if clips overlap or are close enough to merge
+        # STRICTER merging to avoid combining different topic segments
         if current_start <= prev_end + gap_threshold:
             # Merge by extending the end time
             merged[-1] = (prev_start, max(prev_end, current_end))
+            logger.info(f"🔗 MERGED clips: ({prev_start:.1f}-{prev_end:.1f}) + ({current_start:.1f}-{current_end:.1f}) = ({prev_start:.1f}-{max(prev_end, current_end):.1f})")
         else:
-            # Add as new clip
+            # Add as new clip - gap too large, likely different topic
+            logger.info(f"📍 SEPARATE clips: Gap of {current_start - prev_end:.1f}s too large, keeping separate")
             merged.append((current_start, current_end))
     
-    logger.info(f"Merged {len(clips)} clips into {len(merged)} clips")
+    logger.info(f"Merged {len(clips)} clips into {len(merged)} clips with stricter criteria")
     return merged
 
 
@@ -225,7 +229,7 @@ def prepare_clips_for_topic(video_path: str,
                            output_dir: str = "temp_processing",
                            min_clip_duration: float = 2.0) -> Dict:
     """
-    Prepare video clips for a specific topic.
+    Prepare video clips for a specific topic with enhanced timestamp accuracy.
     
     Args:
         video_path: Path to source video
@@ -238,36 +242,97 @@ def prepare_clips_for_topic(video_path: str,
         - clips: List of clip file paths
         - timestamps: List of (start, end) tuples
         - total_duration: Total duration of all clips
+        - segment_info: Details about each segment
     """
-    logger.info(f"Preparing clips from {len(segment_groups)} segment groups")
+    logger.info(f"🎯 Preparing clips from {len(segment_groups)} topic-relevant segment groups")
+    logger.info(f"🔍 VERIFYING: Each segment group will be used for video extraction")
     
     # Get video duration
     try:
         with VideoFileClip(video_path) as video:
             video_duration = video.duration
+            logger.info(f"📹 Source video duration: {video_duration:.2f}s")
     except Exception as e:
         logger.error(f"Could not get video duration: {e}")
         video_duration = None
     
-    # Extract timestamps from groups
+    # Extract timestamps from groups with better context
     raw_timestamps = []
-    for group in segment_groups:
+    segment_info = []
+    invalid_count = 0
+    
+    for i, group in enumerate(segment_groups):
         if not group:
+            logger.warning(f"Empty group {i}, skipping...")
             continue
         
+        # Get the full range of this segment group
         start = convert_timestamp_to_seconds(group[0].get("start", 0))
         end = convert_timestamp_to_seconds(group[-1].get("end", start + 1))
         
-        # Expand clip duration
-        start, end = expand_clip_duration(start, end, min_clip_duration, 
-                                         max_duration=30.0, video_duration=video_duration)
+        # 🎯 CRITICAL: Validate timestamps before using them
+        if start == 0 and end == 0:
+            logger.error(f"❌ INVALID GROUP {i}: Both start and end are 0!")
+            invalid_count += 1
+            continue
+            
+        if start >= end:
+            logger.error(f"❌ INVALID GROUP {i}: start ({start}) >= end ({end})")
+            invalid_count += 1
+            continue
+            
+        if video_duration and start >= video_duration:
+            logger.error(f"❌ INVALID GROUP {i}: start ({start}s) beyond video duration ({video_duration}s)")
+            invalid_count += 1
+            continue
         
-        raw_timestamps.append((start, end))
+        logger.info(f"✅ VALID GROUP {i}: {start:.1f}s - {end:.1f}s (duration: {end-start:.1f}s)")
+        
+        # MINIMAL context padding to avoid irrelevant content - reduced from 1.0 to 0.2 seconds
+        context_padding = 0.2  # Only 0.2 seconds of context before/after
+        start_with_context = max(0, start - context_padding)
+        end_with_context = end + context_padding
+        if video_duration:
+            end_with_context = min(video_duration, end_with_context)
+        
+        # Expand clip duration for minimum requirements with minimal expansion
+        final_start, final_end = expand_clip_duration(
+            start_with_context, end_with_context, 
+            min_duration=1.0,  # Fixed parameter name - was min_clip_duration
+            max_duration=30.0, 
+            video_duration=video_duration
+        )
+        
+        raw_timestamps.append((final_start, final_end))
+        
+        # Store segment information
+        segment_text = " ".join([seg.get("text", "") for seg in group])
+        segment_info.append({
+            "group_id": i,
+            "original_start": start,
+            "original_end": end,
+            "final_start": final_start,
+            "final_end": final_end,
+            "duration": final_end - final_start,
+            "text_preview": segment_text[:100] + "..." if len(segment_text) > 100 else segment_text
+        })
+        
+        logger.info(f"   📍 Final timestamps: {start:.1f}s-{end:.1f}s → {final_start:.1f}s-{final_end:.1f}s ({final_end-final_start:.1f}s)")
     
-    # Merge overlapping or nearby clips
-    merged_timestamps = merge_overlapping_clips(raw_timestamps, gap_threshold=3.0)
+    if invalid_count > 0:
+        logger.error(f"❌ FOUND {invalid_count} INVALID TIMESTAMP GROUPS!")
+        logger.error(f"❌ This will cause video clips to be extracted from wrong locations!")
     
-    # Extract clips
+    if not raw_timestamps:
+        logger.error(f"❌ NO VALID TIMESTAMPS for video extraction!")
+        raise ValueError("No valid timestamps available for video clip extraction")
+    
+    # Merge overlapping or nearby clips for smoother transitions
+    logger.info(f"🔗 Merging overlapping clips...")
+    merged_timestamps = merge_overlapping_clips(raw_timestamps, gap_threshold=2.0)
+    logger.info(f"   Merged {len(raw_timestamps)} clips → {len(merged_timestamps)} final clips")
+    
+    # Extract clips with better naming
     clip_paths = extract_clips_from_timestamps(video_path, merged_timestamps, output_dir)
     
     # Calculate total duration
@@ -277,10 +342,15 @@ def prepare_clips_for_topic(video_path: str,
         "clips": clip_paths,
         "timestamps": merged_timestamps,
         "total_duration": total_duration,
-        "num_clips": len(clip_paths)
+        "num_clips": len(clip_paths),
+        "segment_info": segment_info,
+        "video_duration": video_duration
     }
     
-    logger.info(f"Prepared {result['num_clips']} clips with total duration {total_duration:.2f}s")
+    logger.info(f"✅ Prepared {result['num_clips']} synchronized clips:")
+    logger.info(f"   📊 Total duration: {total_duration:.2f}s")
+    logger.info(f"   📹 Coverage: {(total_duration/video_duration*100):.1f}% of source video" if video_duration else "")
+    
     return result
 
 

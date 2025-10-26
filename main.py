@@ -51,6 +51,7 @@ TTS_MODEL = os.getenv("TTS_MODEL", "default")
 EMBEDDING_DB_PATH = os.getenv("VECTOR_DB_PATH", "vector_db.pkl")
 KEEP_CLUSTER_PERCENTILE = float(os.getenv("KEEP_CLUSTER_PERCENTILE", "10.0"))
 MIN_CLUSTER_SIZE = int(os.getenv("MIN_CLUSTER_SIZE", "2"))
+CLEAR_VECTOR_CACHE = os.getenv("CLEAR_VECTOR_CACHE", "true").lower() == "true"  # Clear cache on restart
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -255,7 +256,7 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
     # Build / load vector DB
     update_progress("vectordb", 40, "Building vector database...")
     logger.info("Building or loading vector DB")
-    db = VectorDB(db_path=EMBEDDING_DB_PATH)
+    db = VectorDB(db_path=EMBEDDING_DB_PATH, clear_on_startup=CLEAR_VECTOR_CACHE)
     # Build expects segments list - adapt parse_srt or sentences shape as required
     try:
         segments_for_db = [ {"text": s["text"], "start": s["start"], "end": s["end"]} for s in sentences ]
@@ -294,12 +295,41 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             
             # Convert segments to groups format for clip extraction
             segment_groups = []
-            for segment in relevant_segments:
+            logger.info(f"🎬 Converting {len(relevant_segments)} segments to clip extraction format:")
+            logger.info(f"🔍 VERIFYING TIMESTAMPS received from vector search:")
+            
+            for i, segment in enumerate(relevant_segments):
+                start_time = segment.get("start", 0)
+                end_time = segment.get("end", 0)
+                text_preview = segment.get("text", "")[:60] + "..." if len(segment.get("text", "")) > 60 else segment.get("text", "")
+                
+                # 🎯 CRITICAL: Verify timestamps are not zero or invalid
+                if start_time == 0 and end_time == 0:
+                    logger.error(f"❌ INVALID TIMESTAMPS: Segment {i+1} has 0,0 timestamps!")
+                    logger.error(f"   This will cause incorrect video clips!")
+                    continue
+                
+                if start_time >= end_time:
+                    logger.error(f"❌ INVALID TIMESTAMPS: Segment {i+1} start >= end ({start_time} >= {end_time})")
+                    continue
+                
                 segment_groups.append([{
                     "text": segment.get("text", ""),
-                    "start": segment.get("start", 0),
-                    "end": segment.get("end", 0)
+                    "start": start_time,
+                    "end": end_time
                 }])
+                
+                logger.info(f"   ✅ VALID Clip {i+1}: {start_time:.1f}s-{end_time:.1f}s | \"{text_preview}\"")
+            
+            # Verify we have valid segments
+            if not segment_groups:
+                logger.error(f"❌ NO VALID SEGMENTS for video extraction!")
+                raise RuntimeError("No valid segments with timestamps for video extraction")
+            
+            # Calculate total time coverage
+            total_clip_time = sum((seg.get("end", 0) - seg.get("start", 0)) for seg in relevant_segments if seg.get("start", 0) != seg.get("end", 0))
+            logger.info(f"📊 Total clip duration: {total_clip_time:.1f} seconds")
+            logger.info(f"🎯 CONFIRMATION: Will extract {len(segment_groups)} video clips from these timestamps")
             
             logger.info(f"✅ Enhanced approach: confidence={confidence}%, {len(segment_groups)} groups, {len(relevant_segments)} segments")
             update_progress("query_processing", 58, f"Found {len(segment_groups)} relevant segments (confidence: {confidence}%)")
@@ -317,6 +347,8 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             # Prepare clips from relevant segments
             update_progress("clip_extraction", 60, "Extracting relevant video clips...")
             
+            logger.info(f"🎬 Starting video clip extraction from {len(segment_groups)} timestamp ranges")
+            
             clips_data = prepare_clips_for_topic(
                 video_path, 
                 segment_groups, 
@@ -325,7 +357,17 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             )
             
             clip_paths = clips_data.get("clips", [])
-            logger.info(f"Extracted {len(clip_paths)} video clips")
+            clip_timestamps = clips_data.get("timestamps", [])
+            
+            logger.info(f"📹 Successfully extracted {len(clip_paths)} video clips")
+            
+            # Log the final clip timestamps being used
+            if clip_timestamps:
+                logger.info(f"🎯 Final video clips timestamps:")
+                for i, (start, end) in enumerate(clip_timestamps):
+                    duration = end - start
+                    logger.info(f"   Final Clip {i+1}: {start:.1f}s - {end:.1f}s ({duration:.1f}s duration)")
+            
             update_progress("clip_extraction", 70, f"Extracted {len(clip_paths)} clips")
             
             if not clip_paths:
@@ -347,6 +389,11 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
             # Assemble final video
             update_progress("assembly", 90, "Assembling final video...")
             
+            logger.info(f"🎬 Final video assembly:")
+            logger.info(f"   📹 Input clips: {len(clip_paths)} files")
+            logger.info(f"   🎵 Voiceover: {voiceover_path}")
+            logger.info(f"   📝 Summary length: {len(summary_text)} characters")
+            
             try:
                 final = assemble_topic_video(
                     clip_paths=clip_paths,
@@ -354,7 +401,8 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
                     output_path=output_path,
                     adjust_speed=True
                 )
-                logger.info(f"Final video assembled: {final}")
+                logger.info(f"✅ Final synchronized video created: {final}")
+                logger.info(f"🎯 Video contains clips from timestamps found by vector search for '{query}'")
             except Exception as e:
                 logger.error(f"Video assembly failed: {e}")
                 raise RuntimeError(f"Failed to assemble video: {e}")
