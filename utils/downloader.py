@@ -120,3 +120,12 @@ def download_and_extract_audio(youtube_url: str) -> Tuple[str, str]:
         except Exception as e2:
             print('yt-dlp fallback failed:', e2)
             raise
+
+if __name__ == "__main__":
+    # simple test
+    test_url = "https://www.youtube.com/watch?v=kp3fCihUXEg"
+    video_path, audio_path = download_and_extract_audio(
+        test_url
+    )
+    print("Video saved to:", video_path)
+    print("Audio saved to:", audio_path)

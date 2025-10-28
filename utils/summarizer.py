@@ -17,9 +17,21 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Import translation utility
+try:
+    from utils.translator import translate_text, is_translation_available
+except ImportError:
+    # Fallback if running as standalone
+    try:
+        from translator import translate_text, is_translation_available
+    except ImportError:
+        logger.warning("Translation utility not available")
+        translate_text = None
+        is_translation_available = lambda: False
+
 # OpenRouter client via openai package as used earlier
 from openai import OpenAI
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY_2")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 CLASSIFY_MODEL = os.getenv("OPENROUTER_CLASSIFY_MODEL", "nvidia/nemotron-nano-9b-v2:free")
 SUMMARIZE_MODEL = os.getenv("OPENROUTER_SUMMARIZE_MODEL", "nvidia/nemotron-nano-9b-v2:free")
@@ -64,30 +76,58 @@ def _safe_openrouter_call(model: str, messages: List[Dict[str, str]], max_retrie
     logger.error("OpenRouter failed after retries: %s", last_err)
     return None
 
-def _classify_cluster_openrouter(cluster_text: str) -> Tuple[bool, str]:
+def _classify_cluster_openrouter(cluster_text: str, topic: str) -> Tuple[bool, str]:
     """
     Ask OpenRouter whether this cluster is meaningful (importance).
     Expects a JSON-like answer but handles plain text.
     Returns: (important_bool, reason_text)
     """
     prompt = (
-        "You are an assistant that classifies transcript chunks. "
-        "Return JSON only with keys: important (true/false) and reason (string). "
-        "Important means this chunk is a real technical explanation or an essential part "
-        "of a concept that should be kept in a condensed educational video. "
-        "Filler includes subscribe requests, greetings, short chit-chat, or unrelated tangents.\n\n"
-        "TRANSCRIPT:\n" + cluster_text
+        f"You are an assistant that classifies transcript chunks based on their relevance to a user's query.\n"
+        f"Return JSON only with keys: 'important' (true/false) and 'reason' (string).\n\n"
+        f"The user is specifically looking for content about: {topic}\n\n"
+        f"CRITICAL RULES:\n"
+        f"1. A chunk is 'important' (true) ONLY if it EXPLICITLY mentions or discusses '{topic}' by name.\n"
+        f"2. A chunk is 'filler' (false) if:\n"
+        f"   - It's a greeting, subscribe request, or chit-chat\n"
+        f"   - It discusses a DIFFERENT algorithm/topic, even if related or similar\n"
+        f"   - It only mentions '{topic}' in passing without explaining it\n"
+        f"   - It compares other things to '{topic}' but doesn't explain '{topic}' itself\n\n"
+        f"EXAMPLE: If user asks for 'Timsort':\n"
+        f"  - 'Timsort was created in 2002...' → IMPORTANT (true)\n"
+        f"  - 'Almost exactly like insertion sort...' → FILLER (false) - describes heap sort, not Timsort\n"
+        f"  - 'Bubble sort is easy to understand...' → FILLER (false) - different algorithm\n\n"
+        f"USER QUERY: {topic}\n\n"
+        f"TRANSCRIPT:\n{cluster_text}"
     )
     content = _safe_openrouter_call(CLASSIFY_MODEL, [{"role":"user","content":prompt}])
     if not content:
-        # fallback heuristic: if cluster length > ~30 words, keep; else maybe drop
-        reason = "openrouter-failed-fallback"
-        return (len(cluster_text.split()) > 30, reason)
+        # fallback heuristic: check if topic keywords appear in text
+        topic_lower = topic.lower()
+        text_lower = cluster_text.lower()
+        # Simple keyword matching as fallback
+        if topic_lower in text_lower:
+            return (True, "fallback-keyword-match")
+        else:
+            return (False, "fallback-no-keyword-match")
     # try parse JSON
     try:
         parsed = json.loads(content)
         important = parsed.get("important", True)
         reason = parsed.get("reason", "") or content
+        
+        # Additional safety check: if classified as important but topic keyword not in text, be suspicious
+        if important:
+            topic_keywords = topic.lower().replace(" ", "").replace("-", "")
+            text_normalized = cluster_text.lower().replace(" ", "").replace("-", "")
+            if topic_keywords not in text_normalized:
+                # LLM said important but exact topic name not mentioned - double-check
+                logger.warning(f"Cluster classified as important but '{topic}' not found in text. Reason: {reason}")
+                # If LLM gave a weak reason, reject it
+                if "similar" in reason.lower() or "related" in reason.lower() or "like" in reason.lower():
+                    logger.info(f"Rejecting cluster: too vague - {reason}")
+                    return (False, f"rejected-vague-match: {reason}")
+        
         return (bool(important), reason)
     except Exception:
         lc = content.lower()
@@ -95,13 +135,14 @@ def _classify_cluster_openrouter(cluster_text: str) -> Tuple[bool, str]:
             return (False, content)
         return (True, content)
 
-def _summarize_cluster_openrouter(cluster_text: str) -> str:
+def _summarize_cluster_openrouter(cluster_text: str,topic: str) -> str:
     prompt = (
-        "Rewrite the following transcript into a concise, clear, and complete educational explanation. "
-        "Keep technical terms, steps and examples. Make it substantially shorter than the original but "
-        "preserve the meaning and the example (i.e., a viewer should understand and be able to apply the concept). "
-        "Output 3-6 short sentences suitable for a 2-3 minute spoken voiceover.\n\n"
-        "TRANSCRIPT:\n" + cluster_text
+        f"You are an assistant creating a focused summary. The user's main interest is: {topic}\n\n"
+        f"Rewrite the following transcript into a concise educational explanation that *emphasizes* information related to '{topic}'.\n"
+        f"Keep technical terms, steps, and examples relevant to the user's interest. Filter out details that are not related, even if they are technical.\n"
+        f"Output 3-6 short sentences suitable for a voiceover.\n\n"
+        f"USER QUERY: {topic}\n\n"
+        f"TRANSCRIPT:\n{cluster_text}"
     )
     content = _safe_openrouter_call(SUMMARIZE_MODEL, [{"role":"user","content":prompt}])
     if content:
@@ -139,11 +180,13 @@ def _merge_scenes_for_cluster(cluster_start: float, cluster_end: float, scenes: 
 
 # ---- main summarizer function ----
 def summarize_topics(
+    query: str,
     topic_clusters: Dict[int, List[Dict]],
     scenes: List[Tuple[Optional[float], Optional[float]]],
     video_duration: float,
     require_classification: bool = True,
-    use_openrouter: bool = True
+    use_openrouter: bool = True,
+    target_language: Optional[str] = None
 ) -> Dict[int, Dict[str, Any]]:
     """
     Summarize clusters and return:
@@ -175,7 +218,7 @@ def summarize_topics(
         cls_reason = ""
         if require_classification and use_openrouter and USE_OPENROUTER:
             try:
-                keep, cls_reason = _classify_cluster_openrouter(cluster_text)
+                keep, cls_reason = _classify_cluster_openrouter(cluster_text, query)
             except Exception as e:
                 logger.warning("Classification exception for cluster %s: %s", cid, e)
                 keep = True
@@ -194,7 +237,7 @@ def summarize_topics(
 
         # Summarize (prefer OpenRouter)
         if use_openrouter and USE_OPENROUTER:
-            summary = _summarize_cluster_openrouter(cluster_text)
+            summary = _summarize_cluster_openrouter(cluster_text, query)
         else:
             # local fallback
             if _local_summarizer:
@@ -214,5 +257,19 @@ def summarize_topics(
             "sentences": sentences
         }
         logger.info("Cluster %s kept: %.2f-%.2f summary len=%d", cid, merged_start, merged_end, len(summary.split()))
+
+    # Translate all summaries if target language specified
+    if target_language and translate_text and is_translation_available():
+        logger.info(f"Translating {len(results)} summaries to {target_language}")
+        for cid, data in results.items():
+            original_summary = data["summary"]
+            try:
+                translated = translate_text(original_summary, target_language, source_language="en-IN")
+                if translated and translated != original_summary:
+                    data["summary"] = translated
+                    logger.info(f"Cluster {cid} translated successfully")
+            except Exception as e:
+                logger.warning(f"Translation failed for cluster {cid}: {e}, keeping original")
+                # Keep original summary on error
 
     return results

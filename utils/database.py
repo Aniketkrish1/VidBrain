@@ -31,7 +31,7 @@ def parse_srt(file_path):
 # 2. Embed with Torch (GPU if available)
 # ------------------------------
 class VectorDB:
-    def __init__(self, model_name="all-MiniLM-L6-v2", db_path="vector_db.pkl"):
+    def __init__(self, model_name="all-mpnet-base-v2", db_path="vector_db.pkl"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = SentenceTransformer(model_name, device=self.device)
         self.db_path = db_path
@@ -44,6 +44,7 @@ class VectorDB:
         print(self.device)
     def build(self, segments):
         texts = [seg["text"] for seg in segments]
+        print(texts,file=open("aaa/segments_texts.txt","w"))
         embeddings = self.model.encode(texts, convert_to_tensor=True, device=self.device)
 
         # Ensure start/end are numeric floats in metadata
@@ -77,12 +78,12 @@ class VectorDB:
             self.embeddings = data["embeddings"].to(self.device)
             self.metadata = data["metadata"]
 
-    def search(self, query, top_k=5):
+    def search(self, query, top_k=10):
         # If embeddings are not built/loaded, return no results so caller falls back
         # to clustering logic.
         if self.embeddings is None:
             return []
-
+        top_k=10
         query_emb = self.model.encode([query], convert_to_tensor=True, device=self.device)
         scores = torch.nn.functional.cosine_similarity(query_emb, self.embeddings)
         topk = torch.topk(scores, k=min(top_k, self.embeddings.size(0)))
@@ -95,6 +96,7 @@ class VectorDB:
                 "end": float(self.metadata[idx]["end"]),
                 "score": float(score)
             })
+        print(results,file=open("aaa/retrieved_results.txt","w"))
         return results
 
 # ------------------------------

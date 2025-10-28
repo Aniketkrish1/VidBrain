@@ -19,3 +19,6 @@ tqdm
 python-dotenv
 yt-dlp
 ffmpeg-python
+requests>=2.31.0
+gtts>=2.5.0
+pydub>=0.25.1

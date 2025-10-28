@@ -36,7 +36,8 @@ from utils import transcriber as tb
 from utils import summarizer as sz
 from utils.database import VectorDB, parse_srt
 from utils import scene_detector as sd
-
+from utils import assmble_video as av
+from utils import translator as tr
 # ==== CONFIG ====
 TEMP_DIR = os.getenv("TEMP_DIR", "temp_processing")
 OUTPUT_VIDEO_NAME = os.getenv("OUTPUT_VIDEO_NAME", "summary_output.mp4")
@@ -120,26 +121,69 @@ def make_topic_clusters_from_db_hits(groups: List[List[Dict]]) -> Dict[int, List
     return clusters
 
 # ==== TTS helper ====
-def generate_voiceovers_from_summaries(summaries: Dict[int, Dict], tts_model: str = TTS_MODEL) -> Dict[int, str]:
+def generate_voiceovers_from_summaries(
+    summaries: Dict[int, Dict], 
+    tts_model: str = TTS_MODEL,
+    target_language: Optional[str] = None
+) -> Dict[int, str]:
     """
     Input summaries: {cluster_id: {"summary": str, "start": float, "end": float, ...}}
     Returns: {cluster_id: audio_path}
+    
+    Uses gTTS for all languages (reliable and supports 50+ languages).
+    Falls back to Coqui TTS only if gTTS fails.
     """
     logger.info("Starting TTS generation for %d summaries", len(summaries))
-    tts = TTS(model_name=tts_model, progress_bar=False, gpu=torch.cuda.is_available())
+    
+    # Determine language for gTTS
+    lang_name = target_language.lower() if target_language else "english"
+    
+    # Try gTTS first for all languages (it's more reliable)
+    use_gtts = True
+    logger.info(f"Using gTTS for language: {lang_name}")
+    
+    # Initialize Coqui TTS as fallback
+    tts = None
+    
     out = {}
     for cid, data in summaries.items():
         summary_text = data.get("summary", "")
         if not summary_text:
             logger.warning("Empty summary for cluster %s, skipping TTS", cid)
             continue
-        file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.wav")
+        
+        file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.mp3")  # gTTS outputs MP3
+        success = False
+        
         try:
-            tts.tts_to_file(text=summary_text, file_path=file_path)
-            out[cid] = file_path
-            logger.info("TTS written for cluster %s -> %s", cid, file_path)
+            if use_gtts:
+                # Try gTTS first (supports multiple languages, very reliable)
+                success = tr.generate_tts_gtts(
+                    summary_text, 
+                    file_path, 
+                    target_language=lang_name
+                )
+                if success:
+                    logger.info("gTTS written for cluster %s -> %s", cid, file_path)
+                else:
+                    logger.warning("gTTS failed for cluster %s, falling back to Coqui", cid)
+            
+            # Fallback to Coqui TTS if gTTS failed
+            if not success:
+                # Coqui only supports English, so only use as fallback
+                file_path = os.path.join(TEMP_DIR, f"voiceover_{cid}.wav")  # Coqui outputs WAV
+                if tts is None:
+                    tts = TTS(model_name=tts_model, progress_bar=False, gpu=torch.cuda.is_available())
+                tts.tts_to_file(text=summary_text, file_path=file_path)
+                success = True
+                logger.info("Coqui TTS written for cluster %s -> %s", cid, file_path)
+            
+            if success:
+                out[cid] = file_path
+                
         except Exception as e:
             logger.error("TTS failed for cluster %s: %s", cid, e)
+    
     return out
 
 # ==== assemble (uses summaries dict) ====
@@ -203,11 +247,18 @@ def assemble_from_summaries(video_path: str, summaries: Dict[int, Dict], voiceov
         gc.collect()
 
 # ==== pipeline entry point ====
-def process_video(video_path: Optional[str], youtube_url: Optional[str], query: Optional[str], output_path: str):
+def process_video(
+    video_path: Optional[str], 
+    youtube_url: Optional[str], 
+    query: Optional[str], 
+    output_path: str,
+    target_language: Optional[str] = None
+):
     """
     If youtube_url provided -> download video -> set video_path accordingly.
     If video_path provided -> use it.
     query: optional user query string (topic to extract); if None, auto-detect topics (clustering)
+    target_language: optional target language for translation and TTS (e.g., 'hindi', 'tamil', 'en-IN')
     """
     setup_dirs()
 
@@ -231,9 +282,13 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
 
     # 2) Transcribe
     logger.info("Transcribing audio")
+    tb.load_models()
     trans_data = tb.transcribe_audio(audio_path)
+    print(trans_data,file=open("aaa/transcription_data.json","w"))
     # trans_data expected: { "sentences": [ {"text","start","end","words"}, ... ], "srt": "...", "language": "en" }
     sentences = trans_data.get("sentences", [])
+    with open("aaa/sentences.json","w") as f:
+        json.dump(sentences,f,indent=2)
     if not sentences:
         raise RuntimeError("Transcription produced no sentences")
 
@@ -258,39 +313,62 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
     # 3) Determine clusters (either via query retrieval or automatic clustering)
     if query and query.strip():
         logger.info("User query provided; retrieving relevant transcript segments")
-        hits = retrieve_by_query(db, query, top_k=5)
+        hits = retrieve_by_query(db, query, top_k=15)
+        print("Retrieved segments:", len(hits))
+        with open("aaa/retrieved_segments.json","w") as f:
+            json.dump(hits,f,indent=2)
         if not hits:
             logger.warning("No results from vector DB for query; falling back to clustering entire transcript")
             topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
         else:
             # merge temporally proximate hits into groups; this keeps explanation parts separated by filler merged
             groups = merge_adjacent_segments(hits, gap_threshold=3.0)
+            with open("aaa/retrieved_groups.json","w") as f:
+                json.dump(groups,f,indent=2)
             topic_clusters = make_topic_clusters_from_db_hits(groups)
+            
     else:
         logger.info("No query: clustering entire transcript")
         topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
-
+    with open("aaa/topic_clusters_from_retrieval.json","w") as f:
+                json.dump(topic_clusters,f,indent=2)
     if not topic_clusters:
         raise RuntimeError("No topic clusters found after retrieval/clustering")
 
     logger.info("Clusters prepared: %d", len(topic_clusters))
-
+    print("Topic clusters:", len(topic_clusters))
     # 4) Scene detection (GPU-accelerated ffmpeg hybrid)
     scenes = sd.detect_scenes(video_path)
     # scenes is list of (start,end) where end may be None for last segment
+    logger.info("Detected %d scenes", len(scenes))
 
     # 5) Summarize clusters (classification + summarization; returns cluster_id -> {summary,start,end,sentences})
     # pass video duration so summarizer can normalize None -> duration
-    with VideoFileClip(video_path) as v:
-        video_duration = v.duration
+    clip = VideoFileClip(video_path)
+    video_duration = clip.duration
+    clip.close()
 
-    summaries = sz.summarize_topics(topic_clusters, scenes, video_duration=video_duration, require_classification=True, use_openrouter=True)
-
+    logger.info("Video duration: %.2f", video_duration)
+    summaries = sz.summarize_topics(
+        query or "",
+        topic_clusters, 
+        scenes, 
+        video_duration=video_duration, 
+        require_classification=True, 
+        use_openrouter=True,
+        target_language=target_language
+    )
+    with open("aaa/summaries.json","w") as f:
+        json.dump(summaries,f,indent=2)
     if not summaries:
         raise RuntimeError("Summarizer returned no summaries (all clusters filtered)")
 
     # 6) TTS generation
-    voiceover_paths = generate_voiceovers_from_summaries(summaries, tts_model=TTS_MODEL)
+    voiceover_paths = generate_voiceovers_from_summaries(
+        summaries, 
+        tts_model=TTS_MODEL,
+        target_language=target_language
+    )
 
     # sanity check
     missing = [cid for cid in summaries.keys() if cid not in voiceover_paths]
@@ -298,7 +376,7 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
         logger.warning("Missing voiceovers for clusters: %s", missing)
 
     # 7) Assemble condensed video
-    final = assemble_from_summaries(video_path, summaries, voiceover_paths, output_path)
+    final = av.assemble_video(video_path, summaries, voiceover_paths, output_path)
 
     # 8) cleanup
     cleanup()
@@ -309,7 +387,7 @@ def process_video(video_path: Optional[str], youtube_url: Optional[str], query: 
 if __name__ == "__main__":
     try:
         print("="*60)
-        print("🎥  AI Video Summarizer")
+        print("🎥  AI Video Summarizer with Multilingual Support")
         print("="*60)
 
         youtube_url = input("Enter YouTube URL (leave blank if using a local file): ").strip()
@@ -318,6 +396,18 @@ if __name__ == "__main__":
             local_video = input("Enter path to local video file: ").strip()
 
         query = input("Enter topic query (optional, leave blank to condense full video): ").strip()
+        
+        # Language selection
+        print("\nSupported languages:")
+        supported_langs = tr.get_supported_languages()
+        for lang_name, lang_code in supported_langs.items():
+            print(f"  - {lang_name.capitalize()} ({lang_code})")
+        
+        target_lang = input("\nEnter target language (leave blank for English): ").strip()
+        if target_lang and not tr.get_language_code(target_lang):
+            print(f"Warning: '{target_lang}' not recognized, defaulting to English")
+            target_lang = None
+        
         output_path = input("Enter output file name (default summary_output.mp4): ").strip() or OUTPUT_VIDEO_NAME
 
         if youtube_url:
@@ -329,7 +419,13 @@ if __name__ == "__main__":
             print("You must enter either a YouTube URL or a local video path.")
             sys.exit(1)
 
-        process_video(video_path, youtube_url, query if query else None, output_path)
+        process_video(
+            video_path, 
+            youtube_url, 
+            query if query else None, 
+            output_path,
+            target_language=target_lang if target_lang else None
+        )
 
     except Exception as e:
         logger.exception("Pipeline failed: %s", e)

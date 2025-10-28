@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 def assemble_video(
     video_path: str,
-    topic_clusters: Dict[int, List[Dict]],
+    topic_clusters: Dict[int, Dict],
     voiceover_paths: Dict[int, str],
     output_path: str
 ) -> str:
@@ -20,6 +20,7 @@ def assemble_video(
     logger.info("Assembling final summary video")
     original_video = None
     video_segments = []
+    audio_clips = []  # Track audio clips for cleanup
     final_video = None
 
     try:
@@ -31,16 +32,11 @@ def assemble_video(
             raise ValueError("topic_clusters is empty. Nothing to assemble.")
 
         logger.info(f"Found {len(topic_clusters)} clusters: {list(topic_clusters.keys())}")
-
-        for cluster_id in sorted(topic_clusters.keys()):
-            sentences = topic_clusters[cluster_id]
-            if not sentences:
-                logger.warning(f"Cluster {cluster_id} is empty. Skipping.")
-                continue
-
-            # Ensure timestamps exist
-            start_time = sentences[0].get('start')
-            end_time = sentences[-1].get('end')
+        sorted_clusters = sorted(topic_clusters.items(), key=lambda item: item[1]['start'])
+        
+        for cluster_id,data in sorted_clusters:
+            start_time = data.get("start")
+            end_time = data.get("end")
             if start_time is None or end_time is None:
                 logger.warning(f"Cluster {cluster_id} missing start/end timestamps. Skipping.")
                 continue
@@ -57,6 +53,7 @@ def assemble_video(
 
             # Load voiceover audio
             voiceover_audio = AudioFileClip(voiceover_path)
+            audio_clips.append(voiceover_audio)  # Track for cleanup later
 
             # Adjust video segment duration to match voiceover
             if voiceover_audio.duration < video_segment.duration:
@@ -71,12 +68,6 @@ def assemble_video(
 
             # Keep segment for concatenation
             video_segments.append(video_segment)
-
-            # close the original audio file object if possible (audio resources are referenced by clip)
-            try:
-                voiceover_audio.close()
-            except Exception:
-                pass
 
         # Defensive check
         if not video_segments:
@@ -113,6 +104,13 @@ def assemble_video(
         for seg in video_segments:
             try:
                 seg.close()
+            except Exception:
+                pass
+        
+        # Close audio clips
+        for audio in audio_clips:
+            try:
+                audio.close()
             except Exception:
                 pass
 
