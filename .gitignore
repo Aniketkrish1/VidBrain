@@ -41,3 +41,5 @@ aaa/
 *.m4a
 
 
+tests/
+docs/

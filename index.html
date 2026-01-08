@@ -4,6 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>VidBrain · AI Video Summarizer</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/styles.css" />
   </head>
   <body>
@@ -26,38 +28,73 @@
       <section class="hero">
         <div class="container">
           <h2>From long videos to concise, voiceover summaries</h2>
-          <p>Paste a YouTube URL and let AI transcribe, cluster topics, summarize, and produce an audio‑narrated recap.</p>
+          <p>Paste a YouTube URL and let AI transcribe, cluster topics, summarize, and produce an audio‑narrated recap in 10 Indian languages.</p>
         </div>
       </section>
 
       <section id="start" class="container card">
         <h3>Start a new summary</h3>
+        <div class="info-banner">
+          <span class="info-icon">🌟</span>
+          <span>Supports 10 Indian output languages with AI-powered translation</span>
+        </div>
+        <p class="muted small" style="margin-top:8px">Tip: For quick tests use a short YouTube link (under 3 minutes) to see results faster.</p>
         <form id="startForm">
           <div class="grid">
             <label>
               <span>YouTube URL</span>
-              <input type="url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." required />
+              <input type="url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." />
+            </label>
+            <label>
+              <span>Or upload local video</span>
+              <input type="file" name="local_file" accept="video/*" />
             </label>
             <label>
               <span>Whisper model (optional)</span>
               <input type="text" name="whisper_model" placeholder="base | small | medium | large" />
             </label>
             <label>
-              <span>query</span>
+              <span>Query</span>
               <input type="text" name="query" placeholder="What you want?" required />
+            </label>
+            <label class="language-selector">
+              <span>�🇳 Output Language</span>
+              <select name="target_language" class="language-dropdown">
+                <option value="hi">Hindi (हिंदी)</option>
+                <option value="kn">Kannada (ಕನ್ನಡ)</option>
+                <option value="ta">Tamil (தமிழ்)</option>
+                <option value="te">Telugu (తెలుగు)</option>
+                <option value="ml">Malayalam (മലയാളം)</option>
+                <option value="mr">Marathi (मराठी)</option>
+                <option value="bn">Bengali (বাংলা)</option>
+                <option value="gu">Gujarati (ગુજરાતી)</option>
+                <option value="pa">Punjabi (ਪੰਜਾਬੀ)</option>
+                <option value="en">English</option>
+              </select>
             </label>
             <label>
               <span>Output filename (optional)</span>
               <input type="text" name="output_name" placeholder="summary.mp4" />
             </label>
           </div>
-          <button type="submit" class="btn">Create Summary</button>
+          <div style="display:flex;gap:12px;align-items:center;margin-top:12px">
+            <button id="submitBtn" type="submit" class="btn">✨ Create Summary</button>
+            <button id="clearBtn" type="button" class="btn ghost">Clear</button>
+            <div id="miniHint" class="muted small">No signup required • Runs locally</div>
+          </div>
         </form>
 
         <div id="job" class="job hidden">
-          <div class="progress"><div class="bar" id="bar" style="width:0%"></div></div>
-          <p id="status">Queued…</p>
-          <div id="result" class="hidden"></div>
+          <div style="display:flex;align-items:center;gap:12px">
+            <div class="spinner hidden" id="spinner" aria-hidden="true"></div>
+            <div style="flex:1">
+              <div class="progress"><div class="bar" id="bar" style="width:0%"></div></div>
+              <p id="status">Queued…</p>
+              <div id="progressSteps" class="muted small"></div>
+            </div>
+          </div>
+          <div id="result" class="hidden" style="margin-top:12px"></div>
+          <div id="textSummary" class="hidden card" style="margin-top:12px;padding:12px 16px"></div>
         </div>
       </section>
 
@@ -65,10 +102,11 @@
         <h3>How it works</h3>
         <ol>
           <li>Download video and extract audio</li>
-          <li>Transcribe with Whisper</li>
+          <li>Transcribe with Whisper (supports 90+ languages)</li>
           <li>Segment sentences and build transcript + vector DB</li>
           <li>Cluster topics and generate summaries</li>
-          <li>Create TTS voiceovers and assemble the final video</li>
+          <li>Translate to your chosen language (if needed)</li>
+          <li>Create TTS voiceovers and assemble the final condensed video</li>
         </ol>
       </section>
     </main>

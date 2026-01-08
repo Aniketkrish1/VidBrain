@@ -46,21 +46,23 @@ def assemble_video(
             if not voiceover_path or not os.path.exists(voiceover_path):
                 raise FileNotFoundError(f"Missing voiceover for cluster {cluster_id}: {voiceover_path}")
 
-            logger.info(f"Processing cluster {cluster_id} -> {start_time:.2f}-{end_time:.2f}")
-
-            # Extract video segment
-            video_segment = original_video.subclip(start_time, end_time)
-
-            # Load voiceover audio
+            # Load voiceover audio first to get its duration
             voiceover_audio = AudioFileClip(voiceover_path)
             audio_clips.append(voiceover_audio)  # Track for cleanup later
+            
+            voiceover_duration = voiceover_audio.duration
+            original_segment_duration = end_time - start_time
+            
+            logger.info(f"Processing cluster {cluster_id} -> Original: {start_time:.2f}-{end_time:.2f} ({original_segment_duration:.2f}s), Voiceover: {voiceover_duration:.2f}s")
 
-            # Adjust video segment duration to match voiceover
-            if voiceover_audio.duration < video_segment.duration:
-                video_segment = video_segment.subclip(0, voiceover_audio.duration)
-            elif voiceover_audio.duration > video_segment.duration:
-                # extend video to match voiceover duration
-                video_segment = video_segment.loop(duration=voiceover_audio.duration)
+            # Extract video segment ONLY for the voiceover duration (condense the output!)
+            # This ensures the final video is shorter than the original
+            video_extract_duration = min(voiceover_duration, original_segment_duration)
+            video_segment = original_video.subclip(start_time, start_time + video_extract_duration)
+
+            # Only loop if voiceover is longer than available video (rare case)
+            if voiceover_duration > video_extract_duration:
+                video_segment = video_segment.loop(duration=voiceover_duration)
 
             # Replace audio with voiceover (apply short fades)
             audio_clip = voiceover_audio.audio_fadein(0.02).audio_fadeout(0.02)

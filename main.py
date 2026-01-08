@@ -17,7 +17,7 @@ import shutil
 import logging
 import gc
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -54,6 +54,11 @@ logger = logging.getLogger("main")
 def setup_dirs():
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
     logger.info("Temp dir: %s", TEMP_DIR)
+    # Ensure ffmpeg is available on PATH; audio/video operations require it.
+    try:
+        check_ffmpeg()
+    except Exception as e:
+        logger.warning("ffmpeg check failed: %s", e)
 
 def cleanup():
     try:
@@ -62,6 +67,13 @@ def cleanup():
             logger.info("Cleaned up temp files")
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
+
+
+def check_ffmpeg():
+    """Raise a helpful exception if ffmpeg is not available on PATH."""
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is not found on PATH. Install ffmpeg and ensure it's available in your PATH.")
 
 # safe bounding for None end times
 def normalize_end(end: Optional[float], video_duration: float) -> float:
@@ -208,16 +220,25 @@ def assemble_from_summaries(video_path: str, summaries: Dict[int, Dict], voiceov
             if not voice_path or not os.path.exists(voice_path):
                 raise FileNotFoundError(f"Voiceover for cluster {cid} not found: {voice_path}")
 
-            logger.info("Cutting cluster %s: %.2f - %.2f", cid, start, end)
-            clip = original.subclip(start, end)
+            # Load voiceover to get its duration
             audio_clip = AudioFileClip(voice_path)
+            voiceover_duration = audio_clip.duration
+            
+            logger.info("Cluster %s: Original video %.2f-%.2f (%.1fs), Voiceover: %.1fs", 
+                       cid, start, end, end - start, voiceover_duration)
 
-            # sync durations
-            if audio_clip.duration < clip.duration:
-                clip = clip.subclip(0, audio_clip.duration)
-            elif audio_clip.duration > clip.duration:
-                clip = clip.loop(duration=audio_clip.duration)
-
+            # KEY OPTIMIZATION: Use voiceover duration, NOT original video duration!
+            # Extract video starting at timestamp, but only for voiceover length
+            # This ensures output = sum of voiceover lengths (condensed!)
+            video_extract_duration = min(voiceover_duration, end - start)
+            
+            clip = original.subclip(start, start + video_extract_duration)
+            
+            # If voiceover is longer than available video, loop video to match
+            if voiceover_duration > video_extract_duration:
+                clip = clip.loop(duration=voiceover_duration)
+            # If voiceover is shorter, trim video to match (already done above)
+            
             clip = clip.set_audio(audio_clip)
             segments.append(clip)
 
@@ -252,7 +273,8 @@ def process_video(
     youtube_url: Optional[str], 
     query: Optional[str], 
     output_path: str,
-    target_language: Optional[str] = None
+    target_language: Optional[str] = None,
+    progress_hook: Optional[Callable[[int, Optional[str], Optional[str]], None]] = None
 ):
     """
     If youtube_url provided -> download video -> set video_path accordingly.
@@ -260,13 +282,22 @@ def process_video(
     query: optional user query string (topic to extract); if None, auto-detect topics (clustering)
     target_language: optional target language for translation and TTS (e.g., 'hindi', 'tamil', 'en-IN')
     """
+    def _update_progress(percent: Optional[int], status: Optional[str] = None, stage: Optional[str] = None):
+        if progress_hook:
+            try:
+                progress_hook(percent or 0, status, stage)
+            except Exception:
+                pass
+
     setup_dirs()
+    _update_progress(0, "queued", "start")
 
     # 1) Download or use local
     if youtube_url:
         try:
             logger.info("Downloading video from URL")
             video_path, audio_path = dl.download_and_extract_audio(youtube_url)
+            _update_progress(10, "processing", "download")
         except Exception as e:
             logger.error("Download failed: %s", e)
             raise
@@ -276,7 +307,16 @@ def process_video(
         # try to extract audio if not provided
         if not os.path.exists(audio_path):
             import subprocess
-            subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", audio_path], check=False)
+            try:
+                # Ensure ffmpeg exists (setup_dirs also checks, but be defensive)
+                check_ffmpeg()
+                subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "mp3", audio_path], check=True)
+            except subprocess.CalledProcessError as e:
+                logger.error("ffmpeg failed to extract audio: %s", e)
+                raise RuntimeError("ffmpeg failed to extract audio from local video") from e
+            except Exception as e:
+                logger.error("Audio extraction setup failed: %s", e)
+                raise
     else:
         raise ValueError("Either video_path or youtube_url must be provided")
 
@@ -284,6 +324,7 @@ def process_video(
     logger.info("Transcribing audio")
     tb.load_models()
     trans_data = tb.transcribe_audio(audio_path)
+    _update_progress(30, "processing", "transcribe")
     print(trans_data,file=open("aaa/transcription_data.json","w"))
     # trans_data expected: { "sentences": [ {"text","start","end","words"}, ... ], "srt": "...", "language": "en" }
     sentences = trans_data.get("sentences", [])
@@ -299,6 +340,7 @@ def process_video(
     try:
         segments_for_db = [ {"text": s["text"], "start": s["start"], "end": s["end"]} for s in sentences ]
         db.build(segments_for_db)
+        _update_progress(45, "processing", "embed-db")
     except Exception as e:
         logger.warning("VectorDB build warning: %s", e)
         # If build failed, make sure we don't accidentally use an older/stale DB that
@@ -330,6 +372,7 @@ def process_video(
     else:
         logger.info("No query: clustering entire transcript")
         topic_clusters = tc.cluster_topics(sentences, embedding_model=None, min_cluster_size=MIN_CLUSTER_SIZE, keep_percentile=KEEP_CLUSTER_PERCENTILE)
+    _update_progress(55, "processing", "cluster")
     with open("aaa/topic_clusters_from_retrieval.json","w") as f:
                 json.dump(topic_clusters,f,indent=2)
     if not topic_clusters:
@@ -341,6 +384,7 @@ def process_video(
     scenes = sd.detect_scenes(video_path)
     # scenes is list of (start,end) where end may be None for last segment
     logger.info("Detected %d scenes", len(scenes))
+    _update_progress(60, "processing", "scene-detect")
 
     # 5) Summarize clusters (classification + summarization; returns cluster_id -> {summary,start,end,sentences})
     # pass video duration so summarizer can normalize None -> duration
@@ -358,6 +402,7 @@ def process_video(
         use_openrouter=True,
         target_language=target_language
     )
+    _update_progress(75, "processing", "summarize")
     with open("aaa/summaries.json","w") as f:
         json.dump(summaries,f,indent=2)
     if not summaries:
@@ -369,6 +414,7 @@ def process_video(
         tts_model=TTS_MODEL,
         target_language=target_language
     )
+    _update_progress(88, "processing", "tts")
 
     # sanity check
     missing = [cid for cid in summaries.keys() if cid not in voiceover_paths]
@@ -377,9 +423,11 @@ def process_video(
 
     # 7) Assemble condensed video
     final = av.assemble_video(video_path, summaries, voiceover_paths, output_path)
+    _update_progress(95, "processing", "assemble")
 
     # 8) cleanup
     cleanup()
+    _update_progress(100, "completed", "done")
     logger.info("Pipeline finished successfully")
     return final
 

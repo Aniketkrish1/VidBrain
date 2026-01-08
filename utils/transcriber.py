@@ -5,6 +5,7 @@ from faster_whisper import WhisperModel
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 import re
+from pathlib import Path
 # --- Load Environment ---
 load_dotenv()
 
@@ -99,7 +100,11 @@ def _segment_text_with_llm(full_text: str) -> List[str]:
     
     print(f"Requesting sentence segmentation from LLM: {SEGMENT_MODEL}")
     content = _safe_openrouter_call(SEGMENT_MODEL, messages)
-    with open("D:\\major-project\\aaa\\llm_segment_response.txt", "w", encoding="utf-8") as f:
+    # Write debug artifacts next to repository root (aaa/). Use project-relative paths so code is portable.
+    BASE_DIR = Path(__file__).resolve().parents[1]
+    AAA_DIR = BASE_DIR / "aaa"
+    AAA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(AAA_DIR / "llm_segment_response.txt", "w", encoding="utf-8") as f:
         f.write(content or "No response")
     
     if not content:
@@ -376,12 +381,18 @@ def transcribe_audio(audio_path: str) -> Dict:
         if not llm_sentences or (len(llm_sentences) == 1 and len(llm_sentences[0].split()) > 40):
             print("Segmentation fallback: splitting by pauses and length heuristics")
             llm_sentences = _segment_text_fallback_by_pauses(transcription_data["words"], max_pause=0.8, max_words=30)
-        with open("D:\\major-project\\aaa\\llm_sentences.txt", "w", encoding="utf-8") as f:
+        BASE_DIR = Path(__file__).resolve().parents[1]
+        AAA_DIR = BASE_DIR / "aaa"
+        AAA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(AAA_DIR / "llm_sentences.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(llm_sentences))
         
         # --- STAGE 3: Re-alignment (with original spelling) ---
         sentences = _realign_sentences_to_words(llm_sentences, transcription_data["words"])
-        with open("D:\\major-project\\aaa\\realigned_sentences.json", "w", encoding="utf-8") as f:
+        BASE_DIR = Path(__file__).resolve().parents[1]
+        AAA_DIR = BASE_DIR / "aaa"
+        AAA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(AAA_DIR / "realigned_sentences.json", "w", encoding="utf-8") as f:
             json.dump(sentences, f, ensure_ascii=False, indent=4)
         # Preserve a copy of the original sentence text before any spelling correction
         for s in sentences:
@@ -391,12 +402,18 @@ def transcribe_audio(audio_path: str) -> Dict:
         # --- STAGE 4: Fix Spelling (AFTER alignment to preserve timestamps) ---
         # Only attempt spelling correction on the final sentence texts; timestamps and per-word data remain unchanged.
         sentences = _fix_spelling_with_llm(sentences)
-        with open("D:\\major-project\\aaa\\spelling_corrected_sentences.json", "w", encoding="utf-8") as f:
+        BASE_DIR = Path(__file__).resolve().parents[1]
+        AAA_DIR = BASE_DIR / "aaa"
+        AAA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(AAA_DIR / "spelling_corrected_sentences.json", "w", encoding="utf-8") as f:
             json.dump(sentences, f, ensure_ascii=False, indent=4)
         
         # --- STAGE 5: Build SRT ---
         srt_text = build_srt(sentences)
-        with open("D:\\major-project\\Outputs\\transcript.txt", "w", encoding="utf-8") as f:
+        BASE_DIR = Path(__file__).resolve().parents[1]
+        OUT_DIR = BASE_DIR / "Outputs"
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        with open(OUT_DIR / "transcript.txt", "w", encoding="utf-8") as f:
             f.write("\n".join([f"{sentence['text']},{sentence['start']},{sentence['end']}" for sentence in sentences]))
         print("Transcription and LLM segmentation is complete")
         return {

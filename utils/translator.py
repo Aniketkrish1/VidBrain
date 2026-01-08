@@ -8,10 +8,13 @@ Provides safe fallbacks to ensure pipeline stability.
 import os
 import logging
 import requests
+from pathlib import Path
 from typing import Optional, Dict, List
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from project root (parent of utils/)
+_project_root = Path(__file__).resolve().parent.parent
+load_dotenv(_project_root / ".env")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -54,8 +57,18 @@ def get_language_code(language: str) -> Optional[str]:
     Get Sarvam AI language code from user-friendly language name.
     Returns None if language not supported.
     """
-    lang_lower = language.lower().strip()
-    return SUPPORTED_LANGUAGES.get(lang_lower)
+    if not language:
+        return None
+    lang = language.lower().strip()
+    # If user provided full Sarvam code already (e.g., 'hi-IN'), accept it
+    if lang in SUPPORTED_LANGUAGES.values():
+        return lang
+    # If user provided 2-letter code (e.g., 'hi'), try to map to the supported value
+    for name, code in SUPPORTED_LANGUAGES.items():
+        if lang == code.split('-')[0]:
+            return code
+    # Otherwise, treat input as name (e.g., 'hindi')
+    return SUPPORTED_LANGUAGES.get(lang)
 
 def translate_text(
     text: str,
@@ -171,8 +184,23 @@ def generate_tts_gtts(
     try:
         from gtts import gTTS
         
-        # Get gTTS language code
-        lang_code = GTTS_LANGUAGE_CODES.get(target_language.lower(), "en")
+        # Resolve target_language which may be a name ('hindi'), a short code ('hi'), or a full code ('hi-IN')
+        t = target_language.lower() if target_language else "english"
+        # If input is already a GTTS code (2-letter), use it
+        if t in GTTS_LANGUAGE_CODES.values():
+            lang_code = t
+        else:
+            # If they passed a 2-letter code like 'hi', map by matching keys' values prefix
+            mapped = None
+            for name, code in SUPPORTED_LANGUAGES.items():
+                if t == code.split('-')[0]:
+                    mapped = GTTS_LANGUAGE_CODES.get(name, None)
+                    break
+            if mapped:
+                lang_code = mapped
+            else:
+                # Try mapping from friendly name
+                lang_code = GTTS_LANGUAGE_CODES.get(t, "en")
         
         logger.info(f"Generating TTS for '{target_language}' (code: {lang_code}) using gTTS")
         
