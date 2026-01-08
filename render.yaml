@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vidbrain-summarizer
+    runtime: docker
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: SARVAM_API_KEY
+        sync: false
+    plan: free # or starter, standard, etc.
+    autoDeploy: false

@@ -21,12 +21,12 @@ def detect_scenes(video_path: str, threshold: float = 0.3, min_scene_len: float 
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "info",
-        "-hwaccel", "cuda",
         "-i", video_path,
         "-filter:v", f"select='gt(scene,{threshold})',showinfo",
         "-f", "null",
         "-"
     ]
+
 
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, universal_newlines=True)
 

@@ -73,7 +73,22 @@ def cluster_topics(
             clusters = {cid: segs for cid, segs in clusters.items() if lengths[cid] >= threshold}
             logger.info("Filtered clusters below %s percentile; kept %d clusters", keep_percentile, len(clusters))
 
-    # sort clusters by earliest start time
-    sorted_clusters = dict(sorted(clusters.items(), key=lambda kv: kv[1][0].get("start", 0.0)))
+    # Sort sentences inside each cluster by their start time to ensure chronological order
+    for cid, segs in clusters.items():
+        try:
+            segs.sort(key=lambda s: float(s.get("start", 0.0)))
+        except Exception:
+            # If conversion fails, leave original order
+            pass
+
+    # sort clusters by the minimum start time across their sentences (robust ordering)
+    def cluster_min_start(kv):
+        segs = kv[1]
+        try:
+            return min(float(s.get("start", 0.0)) for s in segs)
+        except Exception:
+            return 0.0
+
+    sorted_clusters = dict(sorted(clusters.items(), key=cluster_min_start))
     logger.info("cluster_topics -> %d clusters found", len(sorted_clusters))
     return sorted_clusters

@@ -26,7 +26,11 @@ TEMP_DIR=.vidbrain_tmp
 4) Start the server:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+# If your FastAPI app object is defined in top-level `app.py` (this repo):
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+# If the app is in a package `app` with module `main.py` use:
+# uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 5) Open the UI at `http://localhost:8000`.
